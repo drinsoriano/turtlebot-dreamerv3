@@ -1,14 +1,6 @@
 # World Models for Autonomous Terrestrial Robot Navigation
 
-Reinforcement Learning (RL) algorithms are effective for simple autonomous terrestrial robot navigation tasks using
-infrared sensor distance readings as observations. However, current methods are limited as they directly process
-sensor data within policy networks, making it challenging to handle large sensor arrays, and do not utilize model-based
-approaches, reducing their decision-making capabilities. This study introduces a new model-based RL architecture for
-terrestrial robot navigation based on the DreamerV3 algorithm. It employs a world model containing an autoencoder
-for efficient sensor data processing and a dynamics predictor for enhanced decision-making. Comparative analysis of
-experiments conducted using the Turtlebot3 robot on a simulated setting demonstrates that our architecture effectively
-manages larger sensor datasets, significantly improving spatial awareness and navigation performance with both
-reduced sets and complete 360-degree sets of distance sensor readings.
+Autonomous navigation of terrestrial robots using Reinforcement Learning (RL) from LIDAR observations remains challenging due to the high dimensionality of sensor data and the sample inefficiency of model-free approaches. Conventional policy networks struggle to process full-resolution LIDAR inputs, forcing prior works to rely on simplified observations that reduce spatial awareness and navigation robustness. This paper presents a novel model-based RL framework built on top of the DreamerV3 algorithm, integrating a Multi-Layer Perceptron Variational Autoencoder (MLP-VAE) within a world model to encode high-dimensional LIDAR readings into compact latent representations. These latent features, combined with a learned dynamics predictor, enable efficient imagination-based policy optimization. Experiments on simulated TurtleBot3 navigation tasks demonstrate that the proposed architecture achieves faster convergence and higher success rate compared to model-free baselines such as SAC, DDPG, and TD3. It is worth emphasizing that the DreamerV3-based agent attains a 100% success rate across all evaluated environments when using the full dataset of the Turtlebot3 LIDAR (360 readings), while model-free methods plateaued below 85%. These findings demonstrate that integrating predictive world models with learned latent representations enables more efficient and robust navigation from high-dimensional sensory data.
 
 
 ### Results
