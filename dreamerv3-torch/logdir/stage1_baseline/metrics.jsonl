@@ -1,0 +1,5 @@
+{"step": 0, "log_episode_number": 1.0, "log_timestamp": 1779274368.0, "log_success": 0.0, "log_steps_to_goal": -1.0, "log_path_efficiency": 1.1402000188827515, "log_min_obstacle_dist": 0.19629999995231628, "log_near_collisions": 14.0, "log_success_rate": 0.0, "log_collision_rate": 100.0, "dataset_size": 233.0, "train_return": -10.0, "train_length": 233.0, "train_episodes": 1.0, "reward_variance": 0.0}
+{"step": 0, "log_episode_number": 2.0, "log_timestamp": 1779274368.0, "log_success": 0.0, "log_steps_to_goal": -1.0, "log_path_efficiency": 1.0306999683380127, "log_min_obstacle_dist": 0.19869999587535858, "log_near_collisions": 11.0, "log_success_rate": 0.0, "log_collision_rate": 100.0, "dataset_size": 448.0, "train_return": -10.0, "train_length": 215.0, "train_episodes": 2.0, "reward_variance": 0.0}
+{"step": 500}
+{"step": 500}
+{"step": 500}

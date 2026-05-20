@@ -66,6 +66,7 @@ class Logger:
         self._images = {}
         self._videos = {}
         self.step = step
+        self._reward_history = []  # Thesis whitebox — reward variance
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -224,13 +225,22 @@ def simulate(
                         # log items won't be used later
                         cache[envs[i].id].pop(key)
 
+                
                 if not is_eval:
                     step_in_dataset = erase_over_episodes(cache, limit)
                     logger.scalar(f"dataset_size", step_in_dataset)
                     logger.scalar(f"train_return", score)
                     logger.scalar(f"train_length", length)
                     logger.scalar(f"train_episodes", len(cache))
+                    
+                    # Thesis whitebox — Reward Variance σ²R = 1/N × Σ(Ri - R̄)²
+                    logger._reward_history.append(score)
+                    reward_variance = float(np.var(logger._reward_history))
+                    logger.scalar(f"reward_variance", reward_variance)
+                    
                     logger.write(step=logger.step)
+
+
                 else:
                     if not "eval_lengths" in locals():
                         eval_lengths = []
@@ -763,7 +773,7 @@ class Optimizer:
             "sgd": lambda: torch.optim.SGD(parameters, lr=lr),
             "momentum": lambda: torch.optim.SGD(parameters, lr=lr, momentum=0.9),
         }[opt]()
-        self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self._scaler = torch.cuda.amp.GradScaler(enabled=False)
 
     def __call__(self, loss, params, retain_graph=True):
         assert len(loss.shape) == 0, loss.shape

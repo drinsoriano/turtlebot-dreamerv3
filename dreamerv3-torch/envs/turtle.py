@@ -12,7 +12,7 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from gazebo_msgs.srv import SpawnEntity, DeleteEntity, GetEntityState, SetEntityState
 import time
-
+from datetime import datetime
 
 import gym
 from gym import spaces
@@ -131,6 +131,23 @@ class Env(Node):
         self.max_steps = max_steps
         self.lidar = lidar
 
+        
+        # Thesis metrics tracking
+        self.episode_count = 0
+        self.success_count = 0
+        self.collision_count = 0
+        self.prev_x = 0.0
+        self.prev_y = 0.0
+        self.path_length = 0.0
+        self.start_x = 0.0
+        self.start_y = 0.0
+        self.initial_distance = 0.0
+        self.min_obstacle_dist = float('inf')
+        self.near_collision_count = 0
+        self.near_collision_threshold = 0.3
+        self.episode_number = 0
+
+
     def odom_callback(self, msg):
         """
         Callback function for odometry data.
@@ -181,6 +198,18 @@ class Env(Node):
         state = lidar + [distance_to_target, angle_to_target, linear_vel, angular_vel]
         
         state = F.tanh(T.tensor(state)).tolist() # trying some normalization
+
+        
+        # Thesis metrics tracking
+        self.path_length += math.sqrt((turtle_x - self.prev_x)**2 + (turtle_y - self.prev_y)**2)
+        self.prev_x = turtle_x
+        self.prev_y = turtle_y
+        
+        current_min_lidar = min(lidar)
+        if current_min_lidar < self.min_obstacle_dist:
+            self.min_obstacle_dist = current_min_lidar
+        if current_min_lidar < self.near_collision_threshold:
+            self.near_collision_count += 1
         
         return state, turtle_x, turtle_y, lidar
 
@@ -228,8 +257,20 @@ class Env(Node):
 
         state, _, _, _ = self.get_state(0, 0)
 
-        
+        # Thesis metrics reset
+        self.start_x = self.odom_data.pose.pose.position.x
+        self.start_y = self.odom_data.pose.pose.position.y
+        self.prev_x = self.start_x
+        self.prev_y = self.start_y
+        self.path_length = 0.0
+        self.initial_distance = math.sqrt(
+            (self.target_x - self.start_x)**2 +
+            (self.target_y - self.start_y)**2)
+        self.min_obstacle_dist = float('inf')
+        self.near_collision_count = 0
+
         return state
+
 
     def publish_vel(self, linear_vel, angular_vel):
         """
@@ -243,45 +284,70 @@ class Env(Node):
         cmd_vel_msg.angular.z = angular_vel
         self.cmd_vel_publisher.publish(cmd_vel_msg)
 
-    def get_reward_and_done(self, turtle_x, turtle_y, target_x, target_y, lidar_32):
-        """
-        Calculate the reward based on the current state of the environment.
 
-        :param turtle_x: Current x-coordinate of the robot.
-        :param turtle_y: Current y-coordinate of the robot.
-        :param target_x: x-coordinate of the target.
-        :param target_y: y-coordinate of the target.
-        :param lidar_32: LIDAR sensor data.
-        :param steps: Current step count in the episode.
-        :param max_steps: Maximum number of steps in an episode.
-        :return: Reward for the current state and a boolean indicating if the episode is done.
-        """
+    def get_reward_and_done(self, turtle_x, turtle_y, target_x, target_y, lidar_32):
         reward = 0
         done = False
 
-        distance = np.sqrt((turtle_x - target_x)**2 + (turtle_y - target_y)**2) 
-
-        # reward -= distance
+        distance = np.sqrt((turtle_x - target_x)**2 + (turtle_y - target_y)**2)
 
         if distance < REACH_TRESHOLD:
             self.reached = True
             done = True
-            reward = 100 # 200 for distance based
+            reward = 100
             print('[log] Turtlebot3 reached target')
+            # Thesis metrics
+            self.episode_count += 1
+            self.episode_number += 1
+            self.success_count += 1
+            self.log_episode_number = float(self.episode_number)
+            self.log_timestamp = float(datetime.now().timestamp())
+            self.log_success = 1
+            self.log_steps_to_goal = self.step_counter
+            self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
+            self.log_near_collisions = self.near_collision_count
+            self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
+            self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
+
         elif np.min(lidar_32) < COLISION_TRESHOLD:
             self.reached = False
             done = True
             reward = -10
             print('[log] Turtlebot3 colided with object')
+            # Thesis metrics
+            self.episode_count += 1
+            self.episode_number += 1
+            self.collision_count += 1
+            self.log_episode_number = float(self.episode_number)
+            self.log_timestamp = float(datetime.now().timestamp())
+            self.log_success = 0
+            self.log_steps_to_goal = -1
+            self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
+            self.log_near_collisions = self.near_collision_count
+            self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
+            self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
+
         elif self.step_counter >= (self.max_steps - 1):
             self.reached = False
             done = True
             reward = -10
             print('[log] Turtlebot3 reached step limit')
+            # Thesis metrics
+            self.episode_count += 1
+            self.episode_number += 1
+            self.log_episode_number = float(self.episode_number)
+            self.log_timestamp = float(datetime.now().timestamp())
+            self.log_success = 0
+            self.log_steps_to_goal = -1
+            self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
+            self.log_near_collisions = self.near_collision_count
+            self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
+            self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
 
         return reward, done
-
-
 
     def spawn_target_in_environment(self):
         """
@@ -342,10 +408,10 @@ class Env(Node):
 
         obs, turtle_x, turtle_y, lidar32 = self.get_state(action[0], action[1])
 
+        self.step_counter += 1
+
         reward, done = self.get_reward_and_done(turtle_x, turtle_y, self.target_x, self.target_y, lidar32)
 
-        self.step_counter += 1
-        
         return reward, done, obs
     
     def generate_random_target_position(self):
@@ -536,7 +602,32 @@ class Turtle(gym.Env):
     
     def step(self, action):
         reward, done, obs = self._env.step(action)
-        return {'sensor_readings': obs[:self._env.lidar], 'target': obs[self._env.lidar:-2], 'velocity': obs[self._env.lidar + 2:], "image": np.zeros((4, 4, 3), dtype=np.int8), 'is_first': False, 'is_last': False, 'is_terminal': done}, reward, done, {'discount': 0.99}
+        
+        result = {
+            'sensor_readings': obs[:self._env.lidar], 
+            'target': obs[self._env.lidar:-2], 
+            'velocity': obs[self._env.lidar + 2:], 
+            "image": np.zeros((4, 4, 3), dtype=np.int8), 
+            'is_first': False, 
+            'is_last': False, 
+            'is_terminal': done
+        }
+        
+        # I-add ang log_ metrics kapag done ang episode
+        if done:
+            result['log_episode_number'] = float(getattr(self._env, 'log_episode_number', 0))
+            result['log_timestamp'] = float(getattr(self._env, 'log_timestamp', 0))
+            result['log_success'] = float(getattr(self._env, 'log_success', 0))
+            result['log_steps_to_goal'] = float(getattr(self._env, 'log_steps_to_goal', -1))
+            result['log_path_efficiency'] = float(getattr(self._env, 'log_path_efficiency', 0))
+            result['log_min_obstacle_dist'] = float(getattr(self._env, 'log_min_obstacle_dist', 0))
+            result['log_near_collisions'] = float(getattr(self._env, 'log_near_collisions', 0))
+            result['log_success_rate'] = float(getattr(self._env, 'log_success_rate', 0))
+            result['log_collision_rate'] = float(getattr(self._env, 'log_collision_rate', 0))
+            
+        
+        return result, reward, done, {'discount': 0.99}
+
 
     def reset(self):
         obs = self._env.reset()
