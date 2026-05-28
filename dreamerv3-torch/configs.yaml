@@ -18,6 +18,8 @@ defaults:
   precision: 32
   debug: False
   video_pred_log: False # was True
+  stage: 1
+  lidar: 360
 
   # Environment
   task: 'turtle'
@@ -101,5 +103,4 @@ turtle:
   decoder: {mlp_keys: '.*', cnn_keys: '$^'}
   device: 'cpu'
   precision: 32
-  stage: 1
   lidar: 360

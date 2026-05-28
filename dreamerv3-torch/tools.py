@@ -58,15 +58,38 @@ class TimeRecording:
 
 class Logger:
     def __init__(self, logdir, step):
-        self._logdir = logdir
-        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
-        self._last_step = None
-        self._last_time = None
-        self._scalars = {}
-        self._images = {}
-        self._videos = {}
-        self.step = step
-        self._reward_history = []  # Thesis whitebox — reward variance
+            self._logdir = logdir
+            self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+            self._last_step = None
+            self._last_time = None
+            self._scalars = {}
+            self._images = {}
+            self._videos = {}
+            self.step = step
+            self._reward_history = []
+            self._last_train_return = None
+            self._last_reward_variance = None
+            self._last_eval_return = None
+            self._last_eval_success_rate = None
+            self._last_eval_collision_rate = None
+
+            # CSV Logger — White-box
+            import csv
+            os.makedirs('./csv_logs', exist_ok=True)
+            run_name = str(self._logdir).split('/')[-1]
+            wb_path = f'./csv_logs/whitebox_{run_name}.csv'
+            wb_exists = os.path.exists(wb_path)
+            self._wb_file = open(wb_path, 'a', newline='')
+            self._wb_writer = csv.writer(self._wb_file)
+            if not wb_exists:
+                self._wb_writer.writerow([
+                    'datetime', 'step', 'train_return', 'reward_variance',
+                    'model_loss', 'actor_loss', 'value_loss',
+                    'kl', 'prior_ent', 'post_ent',
+                    'eval_return', 'eval_success_rate', 'eval_collision_rate'
+                ])
+            self._wb_file.flush()
+
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -102,6 +125,28 @@ class Logger:
             self._writer.add_video(name, value, step, 16)
 
         self._writer.flush()
+
+        # CSV Logger — White-box
+        s = dict(scalars)
+        if 'model_loss' in s:
+            from datetime import datetime
+            self._wb_writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                step,
+                self._last_train_return if self._last_train_return is not None else '',
+                self._last_reward_variance if self._last_reward_variance is not None else '',
+                s.get('model_loss', ''),
+                s.get('actor_loss', ''),
+                s.get('value_loss', ''),
+                s.get('kl', ''),
+                s.get('prior_ent', ''),
+                s.get('post_ent', ''),
+                self._last_eval_return if self._last_eval_return is not None else '',
+                self._last_eval_success_rate if self._last_eval_success_rate is not None else '',
+                self._last_eval_collision_rate if self._last_eval_collision_rate is not None else ''
+            ])
+            self._wb_file.flush()
+
         self._scalars = {}
         self._images = {}
         self._videos = {}
@@ -237,6 +282,10 @@ def simulate(
                     logger._reward_history.append(score)
                     reward_variance = float(np.var(logger._reward_history))
                     logger.scalar(f"reward_variance", reward_variance)
+
+                    # I-store para ma-access sa write()
+                    logger._last_train_return = score
+                    logger._last_reward_variance = reward_variance
                     
                     logger.write(step=logger.step)
 
@@ -258,8 +307,23 @@ def simulate(
                         logger.scalar(f"eval_return", score)
                         logger.scalar(f"eval_length", length)
                         logger.scalar(f"eval_episodes", len(eval_scores))
+                        
+                        # Thesis — eval success rate
+                        eval_success = sum(1 for s in eval_scores if s == 100)
+                        eval_collision = sum(1 for s in eval_scores if s == -10)
+                        logger.scalar(f"eval_success_rate", 
+                                    round(eval_success / len(eval_scores) * 100, 2))
+                        logger.scalar(f"eval_collision_rate",
+                                    round(eval_collision / len(eval_scores) * 100, 2))
+                        
+                        logger._last_eval_return = score
+                        logger._last_eval_success_rate = round(eval_success / len(eval_scores) * 100, 2)
+                        logger._last_eval_collision_rate = round(eval_collision / len(eval_scores) * 100, 2)
+                        
                         logger.write(step=logger.step)
                         eval_done = True
+
+                        
         if is_eval and i % 2 == 0:
             elapsed = time.time() - start_time
             time.sleep(0.3 - elapsed if elapsed < 0.3 else 0)
