@@ -145,17 +145,14 @@ def make_dataset(episodes, config):
 
 
 def make_env(config, mode, id):
-
-    
     import envs.turtle as turtle
     import rclpy
-
     if not rclpy.ok():
         rclpy.init()
-    env = turtle.Turtle(4, 300, 360)
+    run_name = str(config.logdir).split('/')[-1]
+    env = turtle.Turtle(config.stage, config.time_limit, config.lidar, run_name, mode)
     env = wrappers.UUID(env)
     return env
-
 
 def main(config):
     tools.set_seed_everywhere(config.seed)
