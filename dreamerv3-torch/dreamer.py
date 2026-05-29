@@ -145,14 +145,21 @@ def make_dataset(episodes, config):
 
 
 def make_env(config, mode, id):
-
-    
+    import pathlib
     import envs.turtle as turtle
     import rclpy
 
     if not rclpy.ok():
         rclpy.init()
-    env = turtle.Turtle(4, 300, 360)
+    run_name = pathlib.Path(config.logdir).name if config.logdir else 'baseline'
+    env = turtle.Turtle(
+        config.stage,
+        config.time_limit,
+        config.lidar,
+        run_name=run_name,
+        mode=mode,
+        odometry_mode=config.odometry_mode,
+    )
     env = wrappers.UUID(env)
     return env
 

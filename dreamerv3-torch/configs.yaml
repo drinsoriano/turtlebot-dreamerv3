@@ -20,6 +20,7 @@ defaults:
   video_pred_log: False # was True
   stage: 1
   lidar: 360
+  odometry_mode: 'none'
 
   # Environment
   task: 'turtle'
@@ -104,3 +105,4 @@ turtle:
   device: 'cpu'
   precision: 32
   lidar: 360
+  odometry_mode: 'none'

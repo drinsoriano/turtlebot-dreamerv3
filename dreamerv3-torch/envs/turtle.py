@@ -6,7 +6,7 @@ import torch as T
 import torch.nn.functional as F
 from time import sleep
 from rclpy.node import Node
-from std_srvs.srv import Empty 
+from std_srvs.srv import Empty
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
@@ -14,6 +14,7 @@ from gazebo_msgs.srv import SpawnEntity, DeleteEntity, GetEntityState, SetEntity
 import time
 import csv
 import os
+from collections import deque
 from datetime import datetime
 
 import gym
@@ -27,6 +28,8 @@ EASE_DECAY = 0.005
 EASE_BEGIN = 0.75
 EASE_MIN = 0.01
 MEDIUM_RATE = 0.1
+MIN_GOAL_DIST = 0.8          # minimum distance from robot reset origin to sampled goal
+MAX_GOAL_SPAWN_ATTEMPTS = 10 # retry limit before falling back to farthest candidate
 
 def generate_target_sdf(x, y, z):
         return f"""
@@ -50,7 +53,7 @@ def generate_target_sdf(x, y, z):
         """
 
 class Env(Node):
-    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train'):
+    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
         super().__init__("trainer_node")
 
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -65,7 +68,7 @@ class Env(Node):
         self.unpause_simulation_client = self.create_client(Empty, '/unpause_physics')
 
         self.reset_info()
-        self.init_properties(stage, max_steps, lidar, run_name, mode)
+        self.init_properties(stage, max_steps, lidar, run_name, mode, odometry_mode)
 
     def pause_simulation(self):
         try:
@@ -87,7 +90,7 @@ class Env(Node):
         self.odom_data = None
         self.scan_data = None
 
-    def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train'):
+    def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
         self.num_states = 14
         self.num_actions = 2
         self.action_upper_bound = .25
@@ -100,6 +103,7 @@ class Env(Node):
         self.stage = stage
         self.max_steps = max_steps
         self.lidar = lidar
+        self.odometry_mode = odometry_mode
 
         # Thesis metrics tracking
         self.episode_count = 0
@@ -117,18 +121,53 @@ class Env(Node):
         self.episode_number = 0
         self._mode = mode
 
+        # Odometry ablation: separate from self.prev_x/prev_y used for path-length metrics
+        self.prev_odom_x   = 0.0
+        self.prev_odom_y   = 0.0
+        self.prev_odom_yaw = 0.0
+        self._odom_features = None
+
         # CSV Logger — Black-box
+        # - success_rate / collision_rate: cumulative over all episodes (overall run performance)
+        # - rolling_success_rate_N: rate over the last N episodes (recent learning performance)
+        # - resume logic: if the CSV already exists, counters are seeded from it so that
+        #   episode numbering and cumulative rates continue smoothly after a restart
         os.makedirs('./csv_logs', exist_ok=True)
         bb_path = f'./csv_logs/blackbox_{run_name}.csv'
         bb_exists = os.path.exists(bb_path)
+        self._outcome_history = deque(maxlen=500)
+        if bb_exists:
+            _ep_num, _ep_cnt, _s_cnt, _c_cnt, _outcomes = 0, 0, 0, 0, []
+            try:
+                with open(bb_path, 'r', newline='') as _f:
+                    for _row in csv.DictReader(_f):
+                        try:
+                            _ep_num = max(_ep_num, int(_row['episode']))
+                            _ep_cnt += 1
+                            if _row['outcome'] == 'success':
+                                _s_cnt += 1
+                            elif _row['outcome'] == 'collision':
+                                _c_cnt += 1
+                            _outcomes.append(_row['outcome'])
+                        except (ValueError, KeyError):
+                            continue
+            except Exception:
+                pass
+            self.episode_number  = _ep_num
+            self.episode_count   = _ep_cnt
+            self.success_count   = _s_cnt
+            self.collision_count = _c_cnt
+            self._outcome_history = deque(_outcomes[-500:], maxlen=500)
         self._bb_file = open(bb_path, 'a', newline='')
         self._bb_writer = csv.writer(self._bb_file)
         if not bb_exists:
             self._bb_writer.writerow([
-                'datetime', 'stage', 'episode', 'outcome',
+                'datetime', 'odometry_mode', 'stage', 'episode', 'outcome',
                 'steps_to_goal', 'path_efficiency',
                 'min_obstacle_dist', 'near_collisions',
-                'success_rate', 'collision_rate'
+                'success_rate', 'collision_rate',
+                'rolling_success_rate_100', 'rolling_collision_rate_100',
+                'rolling_success_rate_500', 'rolling_collision_rate_500',
             ])
         self._bb_file.flush()
 
@@ -160,6 +199,27 @@ class Env(Node):
         step = (len(lidar_readings) - 1) // (num_samples - 1)
         lidar = [lidar_readings[i * step] if lidar_readings[i * step] != float('inf') else LIDAR_MAX_RANGE for i in range(num_samples)]
 
+        if self.odometry_mode != 'none':
+            odom_linear_x  = self.odom_data.twist.twist.linear.x
+            odom_angular_z = self.odom_data.twist.twist.angular.z
+            dx_w = turtle_x - self.prev_odom_x
+            dy_w = turtle_y - self.prev_odom_y
+            cos_p = math.cos(self.prev_odom_yaw)
+            sin_p = math.sin(self.prev_odom_yaw)
+            delta_x_local =  dx_w * cos_p + dy_w * sin_p
+            delta_y_local = -dx_w * sin_p + dy_w * cos_p
+            delta_yaw = math.atan2(
+                math.sin(yaw - self.prev_odom_yaw),
+                math.cos(yaw - self.prev_odom_yaw)
+            )
+            if self.odometry_mode == 'twist':
+                raw_odom = [odom_linear_x, odom_angular_z]
+            elif self.odometry_mode == 'delta':
+                raw_odom = [delta_x_local, delta_y_local, delta_yaw]
+            else:  # full
+                raw_odom = [odom_linear_x, odom_angular_z, delta_x_local, delta_y_local, delta_yaw]
+            self._odom_features = F.tanh(T.tensor(raw_odom, dtype=T.float32)).tolist()
+
         state = lidar + [distance_to_target, angle_to_target, linear_vel, angular_vel]
         state = F.tanh(T.tensor(state)).tolist()
 
@@ -173,6 +233,10 @@ class Env(Node):
             self.min_obstacle_dist = current_min_lidar
         if current_min_lidar < self.near_collision_threshold:
             self.near_collision_count += 1
+
+        self.prev_odom_x   = turtle_x
+        self.prev_odom_y   = turtle_y
+        self.prev_odom_yaw = yaw
 
         return state, turtle_x, turtle_y, lidar
 
@@ -204,6 +268,15 @@ class Env(Node):
             rclpy.spin_once(self, timeout_sec=0.5)
             sleep(0.1)
 
+        if self.odometry_mode != 'none':
+            q0 = self.odom_data.pose.pose.orientation
+            self.prev_odom_yaw = math.atan2(
+                2 * (q0.w * q0.z + q0.x * q0.y),
+                1 - 2 * (q0.y * q0.y + q0.z * q0.z)
+            )
+            self.prev_odom_x = self.odom_data.pose.pose.position.x
+            self.prev_odom_y = self.odom_data.pose.pose.position.y
+
         state, _, _, _ = self.get_state(0, 0)
 
         # Thesis metrics reset
@@ -228,20 +301,38 @@ class Env(Node):
 
 
     def _write_blackbox_csv(self, outcome):
-        """Write black-box metrics to CSV."""
+        """Write black-box metrics to CSV.
+
+        Columns written per episode:
+          - success_rate / collision_rate: cumulative over the entire run
+          - rolling_success_rate_N: computed over the last N outcomes in memory
+            (window is seeded from existing CSV rows on startup so rolling rates
+            are meaningful immediately after a restart, not just after N new episodes)
+        """
         if self._mode != 'train':
             return
+        self._outcome_history.append(outcome)
+        _h = list(self._outcome_history)          # up to 500 most recent outcomes
+        _w100 = _h[-100:] if len(_h) >= 100 else _h
+        _w500 = _h                                # deque maxlen=500
+        rs100 = round(_w100.count('success')   / len(_w100) * 100, 2) if _w100 else 0.0
+        rc100 = round(_w100.count('collision') / len(_w100) * 100, 2) if _w100 else 0.0
+        rs500 = round(_w500.count('success')   / len(_w500) * 100, 2) if _w500 else 0.0
+        rc500 = round(_w500.count('collision') / len(_w500) * 100, 2) if _w500 else 0.0
         self._bb_writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            self.stage,  # ← i-add ito
+            self.odometry_mode,
+            self.stage,
             self.episode_number,
             outcome,
             self.step_counter if outcome == 'success' else -1,
-            round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0,
+            min(round(self.initial_distance / self.path_length, 4), 10.0) if self.path_length > 0 else 0.0,
             round(self.min_obstacle_dist, 4),
             self.near_collision_count,
             round(self.success_count / self.episode_count * 100, 2),
-            round(self.collision_count / self.episode_count * 100, 2)
+            round(self.collision_count / self.episode_count * 100, 2),
+            rs100, rc100,
+            rs500, rc500,
         ])
         self._bb_file.flush()
 
@@ -357,37 +448,30 @@ class Env(Node):
 
         return reward, done, obs
 
-    def generate_random_target_position(self):
+    def _sample_target_position(self):
         if self.stage == 1:
-            self.target_x = random.uniform(-1.90, 1.90)
-            self.target_y = random.uniform(-1.90, 1.90)
+            return (random.uniform(-1.90, 1.90), random.uniform(-1.90, 1.90))
         elif self.stage == 2:
             area = np.random.randint(0, 5)
-            if area == 0: 
-                self.target_x = random.uniform(-1.90, 1.90)
-                self.target_y = random.uniform(-1.5, -1.9) 
+            if area == 0:
+                return (random.uniform(-1.90, 1.90), random.uniform(-1.5, -1.9))
             elif area == 1:
-                self.target_x = random.uniform(-1.90, 1.90)
-                self.target_y = random.uniform(1.5, 1.9) 
+                return (random.uniform(-1.90, 1.90), random.uniform(1.5, 1.9))
             elif area == 2:
-                self.target_x = random.uniform(1.5, 1.9)
-                self.target_y = random.uniform(-1.90, 1.90)
+                return (random.uniform(1.5, 1.9), random.uniform(-1.90, 1.90))
             elif area == 3:
-                self.target_x = random.uniform(-1.5, -1.9)
-                self.target_y = random.uniform(-1.90, 1.90)
+                return (random.uniform(-1.5, -1.9), random.uniform(-1.90, 1.90))
             elif area == 4:
-                self.target_x = random.uniform(-0.7, 0.7)
-                self.target_y = random.uniform(-0.7, 0.7)
+                return (random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7))
         elif self.stage == 3:
             points = [(0.5, 1), (0, 0.8), (-.4, 0.5), (-1.5, 1.5),
-                        (-1.7, 0), (-1.5, -1.5), (1.7, 0), (1.7, -.8), 
+                        (-1.7, 0), (-1.5, -1.5), (1.7, 0), (1.7, -.8),
                         (1.7, -1.7), (0.8, -1.5), (0, -1), (-.4, -2),
                         (-1.8, -1.8), (-1.8, -0.5), (-1.8, -1), (-1.8, -1.5),
-                        (-1.6, -1.6), (-1.5, -1.5), (-1.2, -1.2), (-1.3, -1.3), 
+                        (-1.6, -1.6), (-1.5, -1.5), (-1.2, -1.2), (-1.3, -1.3),
                         (1.5, 1.5), (1.5, 1), (1, 1), (0, 1), (.7, 1.7), (-1., 1.7),
                         (-1.5, 1.7), (1.5, 0)]
-            chosen_point = random.choice(points)
-            self.target_x, self.target_y = chosen_point
+            return random.choice(points)
         elif self.stage == 4:
             points = [
                 (0.7, 0), (0.7, 0.5), (0.7, 1.0), (0.7, 1.5), (0.7, 2.0),
@@ -399,8 +483,7 @@ class Env(Node):
                 (2.0, 2.0), (2.0, 1.5), (2.0, 1.2), (1.6, 2.0), (1.6, 1.5), (1.6, 1.2),
                 (2.0, 0.0), (1.5, 0.0), (2.0, -0.5), (1.5, -0.5), (2.0, -1.0), (1.5, -1.0), (2.0, -2.0), (1.5, -2.0), (1.0, -2.0)
             ]
-            chosen_point = random.choice(points)
-            self.target_x, self.target_y = chosen_point
+            return random.choice(points)
         elif self.stage == 5:
             points = [
                 (3.0, 3.0), (3.0, 2.5), (3.0, 1.5), (3.0, 1.0), (3.0, 0.5), (3.0, 0.0),
@@ -417,11 +500,10 @@ class Env(Node):
                 (0.5, -1.0), (0.1, -1.0), (0.5, -1.5), (0.1, -1.5), (0.5, -2.5), (0.1, -2.5),
                 (1.0, -2.5), (1.5, -2.5), (2.0, -2.5), (2.5, -2.5), (3.0, -2.5)
             ]
-            chosen_point = random.choice(points)
-            self.target_x, self.target_y = chosen_point
+            return random.choice(points)
         elif self.stage == 6:
             points = [
-                (0, 0), (0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, -1),
+                (0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, -1),
                 (1.5, 0), (0, -1.5), (-1.5, 0), (1.5, -1.5),
                 (6.5, 3), (6.5, 2.5), (6.5, 2.0), (6.5, 1.5), (6.5, 1.0), (6.5, 0.5), (6.5, 0),
                 (6.5, -3), (6.5, -2.5), (6.5, -2.0), (6.5, -1.5), (6.5, -1.0), (6.5, -0.5),
@@ -453,9 +535,24 @@ class Env(Node):
                 (4, 0), (3.5, 0), (3, 0), (3, -0.5), (3, -1),
                 (-1.5, 1.5), (1.5, 1.5), (-0.2, 1.5), (-1, 1.5), (-5.0, 1.5)
             ]
-            chosen_point = random.choice(points)
-            self.target_x, self.target_y = chosen_point
+            return random.choice(points)
 
+    def generate_random_target_position(self):
+        # Robot always resets to (0.0, 0.0) via /reset_simulation.
+        robot_x, robot_y = 0.0, 0.0
+
+        best_x, best_y, best_dist = 0.0, 0.0, -1.0
+        for _ in range(MAX_GOAL_SPAWN_ATTEMPTS):
+            x, y = self._sample_target_position()
+            dist = math.sqrt((x - robot_x) ** 2 + (y - robot_y) ** 2)
+            if dist > best_dist:
+                best_dist, best_x, best_y = dist, x, y
+            if dist >= MIN_GOAL_DIST:
+                self.target_x, self.target_y = x, y
+                return self.target_x, self.target_y
+
+        # Fallback: farthest candidate seen across all attempts
+        self.target_x, self.target_y = best_x, best_y
         return self.target_x, self.target_y
 
     def handle_spawn_result(self, future, fixed_z):
@@ -477,9 +574,9 @@ class Env(Node):
 
 
 class Turtle(gym.Env):
-    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train'):
+    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
         super(Turtle, self).__init__()
-        self._env = Env(stage, max_steps, lidar, run_name, mode)
+        self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode)
 
         self.observation_space = spaces.Dict({
             'sensor_readings': spaces.Box(low=np.zeros(lidar, dtype=np.float32),
@@ -498,6 +595,16 @@ class Turtle(gym.Env):
 
         self.action_space = spaces.Box(low=np.array([0, -1.]), high=np.array([1., 1.]), dtype=np.float32)
 
+        _odom_shapes = {'twist': (2,), 'delta': (3,), 'full': (5,)}
+        if odometry_mode in _odom_shapes:
+            odom_shape = _odom_shapes[odometry_mode]
+            self.observation_space.spaces['odometry'] = spaces.Box(
+                low=-np.ones(odom_shape, dtype=np.float32),
+                high= np.ones(odom_shape, dtype=np.float32),
+                shape=odom_shape,
+                dtype=np.float32,
+            )
+
     def step(self, action):
         reward, done, obs = self._env.step(action)
 
@@ -510,6 +617,8 @@ class Turtle(gym.Env):
             'is_last': False,
             'is_terminal': done
         }
+        if self._env.odometry_mode != 'none':
+            result['odometry'] = np.array(self._env._odom_features, dtype=np.float32)
 
         if done:
             result['log_episode_number'] = float(getattr(self._env, 'log_episode_number', 0))
@@ -525,7 +634,18 @@ class Turtle(gym.Env):
 
     def reset(self):
         obs = self._env.reset()
-        return {'sensor_readings': obs[:self._env.lidar], 'target': obs[self._env.lidar:-2], 'velocity': obs[self._env.lidar + 2:], "image": np.zeros((4, 4, 3)), 'is_first': True, 'is_last': False, 'is_terminal': False}
+        result = {
+            'sensor_readings': obs[:self._env.lidar],
+            'target': obs[self._env.lidar:-2],
+            'velocity': obs[self._env.lidar + 2:],
+            'image': np.zeros((4, 4, 3)),
+            'is_first': True,
+            'is_last': False,
+            'is_terminal': False,
+        }
+        if self._env.odometry_mode != 'none':
+            result['odometry'] = np.array(self._env._odom_features, dtype=np.float32)
+        return result
 
     def close(self):
         self._env.destroy_node()
