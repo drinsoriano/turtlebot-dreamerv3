@@ -163,7 +163,7 @@ class Env(Node):
         if not bb_exists:
             self._bb_writer.writerow([
                 'datetime', 'odometry_mode', 'stage', 'episode', 'outcome',
-                'steps_to_goal', 'path_efficiency',
+                'steps_to_goal', 'path_directness',
                 'min_obstacle_dist', 'near_collisions',
                 'success_rate', 'collision_rate',
                 'rolling_success_rate_100', 'rolling_collision_rate_100',
@@ -326,7 +326,7 @@ class Env(Node):
             self.episode_number,
             outcome,
             self.step_counter if outcome == 'success' else -1,
-            min(round(self.initial_distance / self.path_length, 4), 10.0) if self.path_length > 0 else 0.0,
+            min(round(self.initial_distance / self.path_length, 4), 1.0) if self.path_length > 0 else 0.0,
             round(self.min_obstacle_dist, 4),
             self.near_collision_count,
             round(self.success_count / self.episode_count * 100, 2),
@@ -355,8 +355,7 @@ class Env(Node):
             self.log_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.log_success = 1
             self.log_steps_to_goal = self.step_counter
-            self.log_path_efficiency = min(round(self.initial_distance / self.path_length, 4), 10.0) if self.path_length > 0 else 0
-            #self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_path_directness = min(round(self.initial_distance / self.path_length, 4), 1.0) if self.path_length > 0 else 0.0
             self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
             self.log_near_collisions = self.near_collision_count
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
@@ -375,8 +374,7 @@ class Env(Node):
             self.log_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.log_success = 0
             self.log_steps_to_goal = -1
-            self.log_path_efficiency = min(round(self.initial_distance / self.path_length, 4), 10.0) if self.path_length > 0 else 0
-            #self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_path_directness = min(round(self.initial_distance / self.path_length, 4), 1.0) if self.path_length > 0 else 0.0
             self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
             self.log_near_collisions = self.near_collision_count
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
@@ -394,8 +392,7 @@ class Env(Node):
             self.log_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.log_success = 0
             self.log_steps_to_goal = -1
-            self.log_path_efficiency = min(round(self.initial_distance / self.path_length, 4), 10.0) if self.path_length > 0 else 0
-            #self.log_path_efficiency = round(self.initial_distance / self.path_length, 4) if self.path_length > 0 else 0
+            self.log_path_directness = min(round(self.initial_distance / self.path_length, 4), 1.0) if self.path_length > 0 else 0.0
             self.log_min_obstacle_dist = round(self.min_obstacle_dist, 4)
             self.log_near_collisions = self.near_collision_count
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
@@ -624,7 +621,7 @@ class Turtle(gym.Env):
             result['log_episode_number'] = float(getattr(self._env, 'log_episode_number', 0))
             result['log_success'] = float(getattr(self._env, 'log_success', 0))
             result['log_steps_to_goal'] = float(getattr(self._env, 'log_steps_to_goal', -1))
-            result['log_path_efficiency'] = float(getattr(self._env, 'log_path_efficiency', 0))
+            result['log_path_directness'] = float(getattr(self._env, 'log_path_directness', 0))
             result['log_min_obstacle_dist'] = float(getattr(self._env, 'log_min_obstacle_dist', 0))
             result['log_near_collisions'] = float(getattr(self._env, 'log_near_collisions', 0))
             result['log_success_rate'] = float(getattr(self._env, 'log_success_rate', 0))

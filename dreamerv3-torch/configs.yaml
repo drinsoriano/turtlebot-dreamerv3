@@ -95,6 +95,7 @@ defaults:
 
 turtle:
   steps: 600000
+  log_every: 2e3
   action_repeat: 1
   envs: 1
   train_ratio: 512
