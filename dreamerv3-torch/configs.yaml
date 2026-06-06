@@ -21,6 +21,8 @@ defaults:
   stage: 1
   lidar: 360
   odometry_mode: 'none'
+  resource_logging: false
+  log_videos: true
 
   # Environment
   task: 'turtle'
@@ -107,3 +109,5 @@ turtle:
   precision: 32
   lidar: 360
   odometry_mode: 'none'
+  resource_logging: false
+  log_videos: false

@@ -159,6 +159,8 @@ def make_env(config, mode, id):
         run_name=run_name,
         mode=mode,
         odometry_mode=config.odometry_mode,
+        device=config.device,
+        resource_logging=config.resource_logging,
     )
     env = wrappers.UUID(env)
     return env
@@ -182,7 +184,7 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    logger = tools.Logger(logdir, config.action_repeat * step, log_videos=config.log_videos)
 
     print("Create envs.")
     if config.offline_traindir:

@@ -53,7 +53,8 @@ def generate_target_sdf(x, y, z):
         """
 
 class Env(Node):
-    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
+    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train',
+                 odometry_mode='none', device='cpu', resource_logging=False):
         super().__init__("trainer_node")
 
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -68,7 +69,8 @@ class Env(Node):
         self.unpause_simulation_client = self.create_client(Empty, '/unpause_physics')
 
         self.reset_info()
-        self.init_properties(stage, max_steps, lidar, run_name, mode, odometry_mode)
+        self.init_properties(stage, max_steps, lidar, run_name, mode, odometry_mode,
+                             device, resource_logging)
 
     def pause_simulation(self):
         try:
@@ -90,7 +92,8 @@ class Env(Node):
         self.odom_data = None
         self.scan_data = None
 
-    def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
+    def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train',
+                        odometry_mode='none', device='cpu', resource_logging=False):
         self.num_states = 14
         self.num_actions = 2
         self.action_upper_bound = .25
@@ -134,8 +137,11 @@ class Env(Node):
         # - rolling_success_rate_N: rate over the last N episodes (recent learning performance)
         # - resume logic: if the CSV already exists, counters are seeded from it so that
         #   episode numbering and cumulative rates continue smoothly after a restart
+        # - mode routing: train env → blackbox_{run_name}.csv, eval env → blackbox_eval_{run_name}.csv
         os.makedirs('./csv_logs', exist_ok=True)
-        bb_path = f'./csv_logs/blackbox_{run_name}.csv'
+        bb_path = (f'./csv_logs/blackbox_{run_name}.csv'
+                   if mode == 'train'
+                   else f'./csv_logs/blackbox_eval_{run_name}.csv')
         bb_exists = os.path.exists(bb_path)
         self._outcome_history = deque(maxlen=500)
         if bb_exists:
@@ -174,8 +180,28 @@ class Env(Node):
         self._bb_file.flush()
 
         # Planning CSV — A* planned path length for planner_path_efficiency metric
+        # mode routing: train → planning_{run_name}.csv, eval → planning_eval_{run_name}.csv
         self._grid_cache: dict = {}
-        self._init_planning_csv(run_name)
+        _pl_name = run_name if mode == 'train' else f'eval_{run_name}'
+        self._init_planning_csv(_pl_name)
+
+        # Path plot subfolder routing: eval plots go to {run_name}_eval/ to avoid mixing
+        self._plot_run_name = run_name if mode == 'train' else f'{run_name}_eval'
+
+        # Resource-cost logger (optional, enabled via --resource_logging True)
+        # mode routing: train → resource_{run_name}.csv, eval → resource_eval_{run_name}.csv
+        self._episode_start_time: float = time.time()
+        self._resource_logger = None
+        if resource_logging:
+            from envs.resource_logger import ResourceLogger
+            _resource_run_name = run_name if mode == 'train' else f'eval_{run_name}'
+            self._resource_logger = ResourceLogger(
+                run_name=_resource_run_name,
+                stage=self.stage,
+                odometry_mode=self.odometry_mode,
+                device=device,
+                lidar=self.lidar,
+            )
 
     def odom_callback(self, msg):
         self.odom_data = msg
@@ -252,6 +278,7 @@ class Env(Node):
         self.spawn_target_in_environment()
 
     def reset(self):
+        self._episode_start_time = time.time()
         self.step_counter = 0
 
         if self.reached == False or (self.reached == True and self.reset_when_reached == True):
@@ -316,9 +343,9 @@ class Env(Node):
           - rolling_success_rate_N: computed over the last N outcomes in memory
             (window is seeded from existing CSV rows on startup so rolling rates
             are meaningful immediately after a restart, not just after N new episodes)
+        Train env writes to blackbox_{run_name}.csv; eval env to blackbox_eval_{run_name}.csv.
+        File routing is done at init — no mode guard needed here.
         """
-        if self._mode != 'train':
-            return
         self._outcome_history.append(outcome)
         _h = list(self._outcome_history)          # up to 500 most recent outcomes
         _w100 = _h[-100:] if len(_h) >= 100 else _h
@@ -359,50 +386,67 @@ class Env(Node):
                 'planned_path_length',
                 'planner_path_efficiency', 'planner_path_efficiency_raw',
                 'planner_status',
+                'planned_path_length_center',
+                'planner_path_efficiency_center', 'planner_path_efficiency_center_raw',
+                'planner_status_center',
             ])
         self._pl_file.flush()
 
     def _compute_planned_path(self) -> tuple:
-        """Run A* from episode start to goal region.
+        """Run A* from episode start to both goal region and goal centre.
 
-        Returns (planned_metres, waypoints, status) where status is one of:
-            ok                 — valid path found
-            no_path            — goal region entirely blocked; A* exhausted
-            planner_error      — unexpected exception inside the planner
-            unsupported_stage  — stage not in stage_map geometry tables
+        Returns (reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status).
+        Status values: ok / no_path / planner_error / unsupported_stage.
+        Grid is loaded once; two A* calls share it.
         """
         try:
-            from envs.stage_map import get_grid, astar_plan, STAGE_ARENAS
+            from envs.stage_map import get_grid, astar_plan, STAGE_ARENAS, RESOLUTION
             if self.stage not in STAGE_ARENAS:
-                return None, [], 'unsupported_stage'
+                s = 'unsupported_stage'
+                return None, [], s, None, [], s
             grid, arena = get_grid(self.stage)
-            length, waypoints = astar_plan(
-                grid, arena,
-                start_xy=(self.start_x, self.start_y),
-                goal_xy=(self.target_x, self.target_y),
-                reach_threshold=REACH_TRESHOLD,
-            )
-            if length is not None:
-                return length, waypoints, 'ok'
-            return None, [], 'no_path'
+            start = (self.start_x, self.start_y)
+            goal  = (self.target_x, self.target_y)
+
+            # Region metric — stop at REACH_TRESHOLD (0.4 m), matches success condition
+            reg_len, reg_wp = astar_plan(grid, arena, start, goal, REACH_TRESHOLD)
+            reg_status = 'ok' if reg_len is not None else 'no_path'
+
+            # Centre metric — stop at RESOLUTION (0.05 m), targets exact goal centre cell
+            # RESOLUTION is the safe minimum: worst-case diagonal snap error ≈ 0.035 m < 0.05 m
+            cen_len, cen_wp = astar_plan(grid, arena, start, goal, RESOLUTION)
+            cen_status = 'ok' if cen_len is not None else 'no_path'
+
+            return reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status
         except Exception:
-            return None, [], 'planner_error'
+            s = 'planner_error'
+            return None, [], s, None, [], s
 
     def _write_planning_csv(self, outcome: str) -> None:
-        if self._mode != 'train':
-            return
         if self.path_length <= 0:
-            planned, waypoints, status = None, [], 'zero_actual_path'
+            reg_len, reg_wp, reg_status = None, [], 'zero_actual_path'
+            cen_len, cen_wp, cen_status = None, [], 'zero_actual_path'
         else:
-            planned, waypoints, status = self._compute_planned_path()
+            reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status = \
+                self._compute_planned_path()
 
-        if status == 'ok':
-            raw          = round(planned / self.path_length, 4)
-            capped       = round(min(raw, 1.0), 4)
-            planned_out  = round(planned, 4)
+        actual = self.path_length
+
+        # Region metric (blank fields for non-ok rows — NaN-friendly in CSV)
+        if reg_status == 'ok':
+            reg_raw    = round(reg_len / actual, 4)
+            reg_capped = round(min(reg_raw, 1.0), 4)
+            reg_out    = round(reg_len, 4)
         else:
-            # Leave numeric fields blank so they do not skew averages or plots.
-            raw = capped = planned_out = ''
+            reg_raw = reg_capped = reg_out = ''
+
+        # Centre metric
+        if cen_status == 'ok':
+            cen_raw    = round(cen_len / actual, 4)
+            cen_capped = round(min(cen_raw, 1.0), 4)
+            cen_out    = round(cen_len, 4)
+        else:
+            cen_raw = cen_capped = cen_out = ''
 
         self._pl_writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -414,28 +458,28 @@ class Env(Node):
             round(self.target_x, 4),
             round(self.target_y, 4),
             round(self.initial_distance, 4),
-            round(self.path_length, 4),
-            planned_out,
-            capped,
-            raw,
-            status,
+            round(actual, 4),
+            reg_out, reg_capped, reg_raw, reg_status,
+            cen_out, cen_capped, cen_raw, cen_status,
         ])
         self._pl_file.flush()
 
         # Save path visualization plot (non-critical; never crashes training)
-        if waypoints:
+        if reg_wp or cen_wp:
             try:
                 from envs.path_viz import save_episode_plot
                 save_episode_plot(
                     stage=self.stage,
                     start=(self.start_x, self.start_y),
                     goal=(self.target_x, self.target_y),
-                    astar_waypoints=waypoints,
+                    astar_waypoints=reg_wp,
+                    astar_center_waypoints=cen_wp,
                     robot_traj=list(self._robot_traj),
                     episode=self.episode_number,
                     outcome=outcome,
-                    run_name=self._run_name,
-                    efficiency=capped if status == 'ok' else '',
+                    run_name=self._plot_run_name,
+                    efficiency=reg_capped if reg_status == 'ok' else '',
+                    efficiency_center=cen_capped if cen_status == 'ok' else '',
                 )
             except Exception:
                 pass
@@ -465,6 +509,8 @@ class Env(Node):
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('success')
             self._write_planning_csv('success')
+            if self._resource_logger is not None:
+                self._resource_logger.log_episode(self.episode_number, self._episode_start_time)
 
         elif np.min(lidar_32) < COLISION_TRESHOLD:
             self.reached = False
@@ -485,6 +531,8 @@ class Env(Node):
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('collision')
             self._write_planning_csv('collision')
+            if self._resource_logger is not None:
+                self._resource_logger.log_episode(self.episode_number, self._episode_start_time)
 
         elif self.step_counter >= (self.max_steps - 1):
             self.reached = False
@@ -504,6 +552,8 @@ class Env(Node):
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('timeout')
             self._write_planning_csv('timeout')
+            if self._resource_logger is not None:
+                self._resource_logger.log_episode(self.episode_number, self._episode_start_time)
 
         return reward, done
 
@@ -677,9 +727,11 @@ class Env(Node):
 
 
 class Turtle(gym.Env):
-    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train', odometry_mode='none'):
+    def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train',
+                 odometry_mode='none', device='cpu', resource_logging=False):
         super(Turtle, self).__init__()
-        self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode)
+        self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
+                        device, resource_logging)
 
         self.observation_space = spaces.Dict({
             'sensor_readings': spaces.Box(low=np.zeros(lidar, dtype=np.float32),

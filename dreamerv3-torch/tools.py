@@ -57,7 +57,7 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
+    def __init__(self, logdir, step, log_videos=True):
             self._logdir = logdir
             self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
             self._last_step = None
@@ -66,6 +66,8 @@ class Logger:
             self._images = {}
             self._videos = {}
             self.step = step
+            self._log_videos = log_videos
+            self._video_warn_printed = False
             self._reward_history = []
             self._last_train_return = None
             self._last_reward_variance = None
@@ -116,13 +118,21 @@ class Logger:
                 self._writer.add_scalar(name, value, step)
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
-        for name, value in self._videos.items():
-            name = name if isinstance(name, str) else name.decode("utf-8")
-            if np.issubdtype(value.dtype, np.floating):
-                value = np.clip(255 * value, 0, 255).astype(np.uint8)
-            B, T, H, W, C = value.shape
-            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
+        if self._log_videos and self._videos:
+            try:
+                for name, value in self._videos.items():
+                    name = name if isinstance(name, str) else name.decode("utf-8")
+                    if np.issubdtype(value.dtype, np.floating):
+                        value = np.clip(255 * value, 0, 255).astype(np.uint8)
+                    B, T, H, W, C = value.shape
+                    value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+                    self._writer.add_video(name, value, step, 16)
+            except Exception:
+                if not self._video_warn_printed:
+                    print('[Logger] TensorBoard video logging disabled. '
+                          'Use CSV/Streamlit dashboard for monitoring.')
+                    self._video_warn_printed = True
+                self._log_videos = False
 
         self._writer.flush()
 
@@ -301,7 +311,8 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+                    if getattr(logger, '_log_videos', True):
+                        logger.video(f"eval_policy", np.array(video)[None])
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
