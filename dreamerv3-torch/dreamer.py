@@ -161,6 +161,12 @@ def make_env(config, mode, id):
         odometry_mode=config.odometry_mode,
         device=config.device,
         resource_logging=config.resource_logging,
+        reward_mode=config.reward_mode,
+        reward_progress_scale=config.reward_progress_scale,
+        reward_step_penalty=config.reward_step_penalty,
+        reward_turn_penalty=config.reward_turn_penalty,
+        reward_near_obstacle_scale=config.reward_near_obstacle_scale,
+        reward_near_obstacle_sigma=config.reward_near_obstacle_sigma,
     )
     env = wrappers.UUID(env)
     return env

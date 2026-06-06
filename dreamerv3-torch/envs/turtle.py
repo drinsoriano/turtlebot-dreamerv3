@@ -54,7 +54,10 @@ def generate_target_sdf(x, y, z):
 
 class Env(Node):
     def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train',
-                 odometry_mode='none', device='cpu', resource_logging=False):
+                 odometry_mode='none', device='cpu', resource_logging=False,
+                 reward_mode='default', reward_progress_scale=1.0,
+                 reward_step_penalty=0.01, reward_turn_penalty=0.01,
+                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
         super().__init__("trainer_node")
 
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -70,7 +73,10 @@ class Env(Node):
 
         self.reset_info()
         self.init_properties(stage, max_steps, lidar, run_name, mode, odometry_mode,
-                             device, resource_logging)
+                             device, resource_logging,
+                             reward_mode, reward_progress_scale,
+                             reward_step_penalty, reward_turn_penalty,
+                             reward_near_obstacle_scale, reward_near_obstacle_sigma)
 
     def pause_simulation(self):
         try:
@@ -93,7 +99,10 @@ class Env(Node):
         self.scan_data = None
 
     def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train',
-                        odometry_mode='none', device='cpu', resource_logging=False):
+                        odometry_mode='none', device='cpu', resource_logging=False,
+                        reward_mode='default', reward_progress_scale=1.0,
+                        reward_step_penalty=0.01, reward_turn_penalty=0.01,
+                        reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
         self.num_states = 14
         self.num_actions = 2
         self.action_upper_bound = .25
@@ -202,6 +211,33 @@ class Env(Node):
                 device=device,
                 lidar=self.lidar,
             )
+
+        # Reward shaping (opt-in via reward_mode='shaped'; 'default' = original sparse reward)
+        self.reward_mode = reward_mode
+        self.reward_progress_scale = reward_progress_scale
+        self.reward_step_penalty = reward_step_penalty
+        self.reward_turn_penalty = reward_turn_penalty
+        self.reward_near_obstacle_scale = reward_near_obstacle_scale
+        self.reward_near_obstacle_sigma = reward_near_obstacle_sigma
+        self.prev_distance_to_target = 0.0
+        self._rc_terminal = self._rc_progress = self._rc_step = 0.0
+        self._rc_turn = self._rc_near = self._rc_total = 0.0
+
+        # Reward-components CSV — per-episode component sums (always written, both modes;
+        # in 'default' mode the shaping columns are all 0 and sum_total == sum_terminal).
+        # mode routing: train → reward_{run_name}.csv, eval → reward_eval_{run_name}.csv
+        rw_path = (f'./csv_logs/reward_{run_name}.csv' if mode == 'train'
+                   else f'./csv_logs/reward_eval_{run_name}.csv')
+        rw_exists = os.path.exists(rw_path)
+        self._rw_file = open(rw_path, 'a', newline='')
+        self._rw_writer = csv.writer(self._rw_file)
+        if not rw_exists:
+            self._rw_writer.writerow([
+                'datetime', 'reward_mode', 'stage', 'episode', 'outcome',
+                'sum_terminal', 'sum_progress', 'sum_step_penalty',
+                'sum_turn_penalty', 'sum_near_obstacle', 'sum_total',
+            ])
+        self._rw_file.flush()
 
     def odom_callback(self, msg):
         self.odom_data = msg
@@ -325,6 +361,11 @@ class Env(Node):
         self.min_obstacle_dist = float('inf')
         self.near_collision_count = 0
         self._robot_traj = [(self.start_x, self.start_y)]
+
+        # Reward-shaping per-episode reset
+        self.prev_distance_to_target = self.initial_distance
+        self._rc_terminal = self._rc_progress = self._rc_step = 0.0
+        self._rc_turn = self._rc_near = self._rc_total = 0.0
 
         return state
 
@@ -484,7 +525,7 @@ class Env(Node):
             except Exception:
                 pass
 
-    def get_reward_and_done(self, turtle_x, turtle_y, target_x, target_y, lidar_32):
+    def get_reward_and_done(self, turtle_x, turtle_y, target_x, target_y, lidar_32, ang_vel_cmd=0.0):
         reward = 0
         done = False
 
@@ -555,6 +596,40 @@ class Env(Node):
             if self._resource_logger is not None:
                 self._resource_logger.log_episode(self.episode_number, self._episode_start_time)
 
+        # ── Optional reward shaping (additive; default mode is a no-op) ──────
+        terminal_component = reward  # 0 on normal steps, +100/-10 on terminal
+        progress = step_pen = turn_pen = near_pen = 0.0
+        if self.reward_mode == 'shaped':
+            progress = self.reward_progress_scale * (self.prev_distance_to_target - distance)
+            step_pen = -self.reward_step_penalty
+            turn_pen = -self.reward_turn_penalty * abs(ang_vel_cmd)
+            d_min = float(np.min(lidar_32))
+            if d_min < self.near_collision_threshold:
+                near_pen = -self.reward_near_obstacle_scale * math.exp(
+                    -d_min / self.reward_near_obstacle_sigma)
+            reward += progress + step_pen + turn_pen + near_pen
+        self.prev_distance_to_target = distance
+
+        self._rc_terminal += terminal_component
+        self._rc_progress += progress
+        self._rc_step     += step_pen
+        self._rc_turn     += turn_pen
+        self._rc_near     += near_pen
+        self._rc_total    += reward
+
+        if done:
+            outcome = ('success' if distance < REACH_TRESHOLD
+                       else 'collision' if np.min(lidar_32) < COLISION_TRESHOLD
+                       else 'timeout')
+            self._rw_writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                self.reward_mode, self.stage, self.episode_number, outcome,
+                round(self._rc_terminal, 4), round(self._rc_progress, 4),
+                round(self._rc_step, 4), round(self._rc_turn, 4),
+                round(self._rc_near, 4), round(self._rc_total, 4),
+            ])
+            self._rw_file.flush()
+
         return reward, done
 
     def spawn_target_in_environment(self):
@@ -597,7 +672,8 @@ class Env(Node):
 
         self.step_counter += 1
 
-        reward, done = self.get_reward_and_done(turtle_x, turtle_y, self.target_x, self.target_y, lidar32)
+        reward, done = self.get_reward_and_done(
+            turtle_x, turtle_y, self.target_x, self.target_y, lidar32, float(action[1]))
 
         return reward, done, obs
 
@@ -728,10 +804,16 @@ class Env(Node):
 
 class Turtle(gym.Env):
     def __init__(self, stage, max_steps, lidar, run_name='baseline', mode='train',
-                 odometry_mode='none', device='cpu', resource_logging=False):
+                 odometry_mode='none', device='cpu', resource_logging=False,
+                 reward_mode='default', reward_progress_scale=1.0,
+                 reward_step_penalty=0.01, reward_turn_penalty=0.01,
+                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
         super(Turtle, self).__init__()
         self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
-                        device, resource_logging)
+                        device, resource_logging,
+                        reward_mode, reward_progress_scale,
+                        reward_step_penalty, reward_turn_penalty,
+                        reward_near_obstacle_scale, reward_near_obstacle_sigma)
 
         self.observation_space = spaces.Dict({
             'sensor_readings': spaces.Box(low=np.zeros(lidar, dtype=np.float32),

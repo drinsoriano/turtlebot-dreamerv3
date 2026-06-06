@@ -6,13 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TurtleBot3 autonomous navigation using DreamerV3 (model-based RL). The robot receives LiDAR observations in a Gazebo simulation (ROS2) and learns to reach randomly-spawned goals while avoiding obstacles. Eight training stages increase in obstacle complexity.
 
-Active development spans two branches: `planner-efficiency-metric` (A* metric + path plots) and `odometry-observation` (odometry ablation).
+Active development spans three branches: `reward-shaping` (current — reward-shaping experiments), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
 
 ## Project Branches
 
 | Branch | Purpose |
 |--------|---------|
-| `planner-efficiency-metric` | Current active branch — A* path efficiency metric, path plot visualization |
+| `reward-shaping` | **Current active branch** — reward-shaping experiments for path efficiency across all stages |
+| `planner-efficiency-metric` | Upstream baseline — A* metric, path plots, dashboard, resource-cost logging |
 | `odometry-observation` | Odometry ablation — none / twist / delta / full modes |
 | `baseline-csv-working` | Frozen checkpoint — preserved and pushed |
 
@@ -95,6 +96,58 @@ Columns: `datetime, stage, episode, outcome, start_x, start_y, target_x, target_
 - `zero_actual_path` — episode ended before any movement
 
 Numeric fields are **blank (empty string)** for non-`ok` rows — never `-1.0` — so pandas/CSV tools treat them as NaN naturally.
+
+## Reward Shaping (branch: `reward-shaping`)
+
+**Goal:** Improve navigation path efficiency across all stages — reduce looping, wandering, and overshooting behavior without breaking success rate.
+
+**Baseline:** `planner-efficiency-metric` branch. All A* metrics, dashboard, and resource-cost logging are inherited unchanged and remain diagnostic/logging only. The A* `planner_path_efficiency` metric is the primary way to measure improvement.
+
+**Scope of changes in this branch:**
+- `dreamerv3-torch/envs/turtle.py` — `get_reward_and_done()` (additive shaping after the **unchanged** terminal block), `step()` (passes the angular command), `init_properties()` / `reset()` / constructors (store knobs, reset per-episode component sums, open the reward CSV).
+- `dreamerv3-torch/configs.yaml` — six reward-shaping config knobs (see below).
+- `dreamerv3-torch/dreamer.py` — `make_env()` only, to forward the knobs into `Turtle(...)`.
+
+**Do not change** in this branch: observation space, odometry modes, DreamerV3 architecture, A* metric computation, dashboard, resource logging, torch/CUDA setup.
+
+### Reward mode (implemented)
+
+Shaping is **opt-in** via `--reward_mode`. The original reward is preserved exactly:
+
+| `reward_mode` | Behavior |
+|---|---|
+| `default` (default) | Original sparse reward, **byte-for-byte unchanged**: `+100` goal, `−10` collision, `−10` timeout, `0` otherwise |
+| `shaped` | Original terminal rewards **plus** the additive shaping terms below, applied every step |
+
+Shaped reward `= reward_default + progress + step_pen + turn_pen + near_obst`:
+
+| RS | Term | Formula | Config knob (default) |
+|---|---|---|---|
+| RS-1 | Progress reward | `+scale * (prev_dist − curr_dist)` | `reward_progress_scale` (1.0) |
+| RS-2 | Step penalty | `−c` per step | `reward_step_penalty` (0.01) |
+| RS-3 | Turning penalty | `−k * |ang_vel_cmd|` | `reward_turn_penalty` (0.01) |
+| RS-4 | Near-obstacle penalty | `−k * exp(−d_min / σ)` when `d_min < 0.3 m` | `reward_near_obstacle_scale` (0.1), `reward_near_obstacle_sigma` (0.25) |
+
+Weights are kept **mild by default** — progress is deliberately weak so complex stages can still take temporary detours around obstacles. All knobs are CLI-overridable.
+
+**Component logging:** per-episode component sums are written to `csv_logs/reward_{run_name}.csv` (eval → `reward_eval_{run_name}.csv`) with columns `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total`. Written in **both** modes; in `default` mode the shaping columns are `0` and `sum_total == sum_terminal`. The blackbox/planning/whitebox/resource CSV schemas are unchanged.
+
+**A* planner-guided reward:** Not approved. Do not implement until explicitly scoped. If added later, label the experiment `RS-P` and isolate in a separate sub-experiment logdir.
+
+### Logdir naming convention for reward-shaping experiments
+
+```
+./logdir/stage{N}_360_none_seed{S}_reward_{default|shaped}
+```
+
+Example: `stage1_360_none_seed0_reward_shaped` for the shaped run on stage 1, `stage1_360_none_seed0_reward_default` for the no-shaping baseline. Replace `{N}` with the target stage number.
+
+### Measuring improvement
+
+Compare against a no-shaping baseline run on this branch for the same stage (not `planner-efficiency-metric`):
+- Primary: `planner_path_efficiency` from `csv_logs/planning_{run_name}.csv`
+- Secondary: `path_directness` from `blackbox_{run_name}.csv`
+- Guard: `success_rate` and `collision_rate` must not regress
 
 ## Path Plots
 
@@ -243,7 +296,9 @@ Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, or
   - `logdir/` — episode archives and checkpoints
   - `csv_logs/` — training metrics CSVs
   - `path_plots/` — path visualization PNGs
-  - `*.pt`, `*.npz`, `*.jsonl`, `tfevents*`
+  - `install/` — install artifacts
+  - `log/` — ROS2/system log output
+  - `*.pt`, `*.npz`, `*.jsonl`, `events.out.tfevents*`
 - Always run before committing:
   ```bash
   git status --short
@@ -379,3 +434,17 @@ Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 - `depth` — depth camera (future)
 - `lidar_depth` — combined (future)
 - Depth camera and CNN integration are future work, separate from the current odometry ablation. Do not implement until explicitly scoped.
+
+
+Test commands (need Gazebo on stage 1)
+
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage1_360_none_seed0_reward_default \
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 5000 --eval_episode_num 2 --reward_mode default
+
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage1_360_none_seed0_reward_shaped \
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 5000 --eval_episode_num 2 --reward_mode shaped
