@@ -41,7 +41,7 @@ def generate_target_sdf(x, y, z):
             <link name='link'>
             <visual name='visual'>
                 <geometry>
-                <plane><normal>0 0 1</normal><size>0.5 0.5</size></plane>
+                <cylinder><radius>0.4</radius><length>0.01</length></cylinder>
                 </geometry>
                 <material>
                 <ambient>1 0 0 1</ambient>
@@ -120,6 +120,8 @@ class Env(Node):
         self.near_collision_threshold = 0.3
         self.episode_number = 0
         self._mode = mode
+        self._run_name = run_name
+        self._robot_traj: list = []  # populated each episode in get_state()
 
         # Odometry ablation: separate from self.prev_x/prev_y used for path-length metrics
         self.prev_odom_x   = 0.0
@@ -170,6 +172,10 @@ class Env(Node):
                 'rolling_success_rate_500', 'rolling_collision_rate_500',
             ])
         self._bb_file.flush()
+
+        # Planning CSV — A* planned path length for planner_path_efficiency metric
+        self._grid_cache: dict = {}
+        self._init_planning_csv(run_name)
 
     def odom_callback(self, msg):
         self.odom_data = msg
@@ -227,6 +233,7 @@ class Env(Node):
         self.path_length += math.sqrt((turtle_x - self.prev_x)**2 + (turtle_y - self.prev_y)**2)
         self.prev_x = turtle_x
         self.prev_y = turtle_y
+        self._robot_traj.append((turtle_x, turtle_y))
 
         current_min_lidar = min(lidar)
         if current_min_lidar < self.min_obstacle_dist:
@@ -290,6 +297,7 @@ class Env(Node):
             (self.target_y - self.start_y)**2)
         self.min_obstacle_dist = float('inf')
         self.near_collision_count = 0
+        self._robot_traj = [(self.start_x, self.start_y)]
 
         return state
 
@@ -336,6 +344,101 @@ class Env(Node):
         ])
         self._bb_file.flush()
 
+    # ── Planning CSV (A* path efficiency) ─────────────────────────────────────
+
+    def _init_planning_csv(self, run_name: str) -> None:
+        pl_path = f'./csv_logs/planning_{run_name}.csv'
+        pl_exists = os.path.exists(pl_path)
+        self._pl_file = open(pl_path, 'a', newline='')
+        self._pl_writer = csv.writer(self._pl_file)
+        if not pl_exists:
+            self._pl_writer.writerow([
+                'datetime', 'stage', 'episode', 'outcome',
+                'start_x', 'start_y', 'target_x', 'target_y',
+                'initial_distance', 'actual_path_length',
+                'planned_path_length',
+                'planner_path_efficiency', 'planner_path_efficiency_raw',
+                'planner_status',
+            ])
+        self._pl_file.flush()
+
+    def _compute_planned_path(self) -> tuple:
+        """Run A* from episode start to goal region.
+
+        Returns (planned_metres, waypoints, status) where status is one of:
+            ok                 — valid path found
+            no_path            — goal region entirely blocked; A* exhausted
+            planner_error      — unexpected exception inside the planner
+            unsupported_stage  — stage not in stage_map geometry tables
+        """
+        try:
+            from envs.stage_map import get_grid, astar_plan, STAGE_ARENAS
+            if self.stage not in STAGE_ARENAS:
+                return None, [], 'unsupported_stage'
+            grid, arena = get_grid(self.stage)
+            length, waypoints = astar_plan(
+                grid, arena,
+                start_xy=(self.start_x, self.start_y),
+                goal_xy=(self.target_x, self.target_y),
+                reach_threshold=REACH_TRESHOLD,
+            )
+            if length is not None:
+                return length, waypoints, 'ok'
+            return None, [], 'no_path'
+        except Exception:
+            return None, [], 'planner_error'
+
+    def _write_planning_csv(self, outcome: str) -> None:
+        if self._mode != 'train':
+            return
+        if self.path_length <= 0:
+            planned, waypoints, status = None, [], 'zero_actual_path'
+        else:
+            planned, waypoints, status = self._compute_planned_path()
+
+        if status == 'ok':
+            raw          = round(planned / self.path_length, 4)
+            capped       = round(min(raw, 1.0), 4)
+            planned_out  = round(planned, 4)
+        else:
+            # Leave numeric fields blank so they do not skew averages or plots.
+            raw = capped = planned_out = ''
+
+        self._pl_writer.writerow([
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            self.stage,
+            self.episode_number,
+            outcome,
+            round(self.start_x, 4),
+            round(self.start_y, 4),
+            round(self.target_x, 4),
+            round(self.target_y, 4),
+            round(self.initial_distance, 4),
+            round(self.path_length, 4),
+            planned_out,
+            capped,
+            raw,
+            status,
+        ])
+        self._pl_file.flush()
+
+        # Save path visualization plot (non-critical; never crashes training)
+        if waypoints:
+            try:
+                from envs.path_viz import save_episode_plot
+                save_episode_plot(
+                    stage=self.stage,
+                    start=(self.start_x, self.start_y),
+                    goal=(self.target_x, self.target_y),
+                    astar_waypoints=waypoints,
+                    robot_traj=list(self._robot_traj),
+                    episode=self.episode_number,
+                    outcome=outcome,
+                    run_name=self._run_name,
+                    efficiency=capped if status == 'ok' else '',
+                )
+            except Exception:
+                pass
 
     def get_reward_and_done(self, turtle_x, turtle_y, target_x, target_y, lidar_32):
         reward = 0
@@ -361,6 +464,7 @@ class Env(Node):
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('success')
+            self._write_planning_csv('success')
 
         elif np.min(lidar_32) < COLISION_TRESHOLD:
             self.reached = False
@@ -380,6 +484,7 @@ class Env(Node):
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('collision')
+            self._write_planning_csv('collision')
 
         elif self.step_counter >= (self.max_steps - 1):
             self.reached = False
@@ -398,6 +503,7 @@ class Env(Node):
             self.log_success_rate = round(self.success_count / self.episode_count * 100, 2)
             self.log_collision_rate = round(self.collision_count / self.episode_count * 100, 2)
             self._write_blackbox_csv('timeout')
+            self._write_planning_csv('timeout')
 
         return reward, done
 
@@ -406,7 +512,7 @@ class Env(Node):
             self.get_logger().info('Service not available, waiting again...')
 
         self.target_x, self.target_y = self.generate_random_target_position()
-        fixed_z = 0.01
+        fixed_z = 0.005  # half of cylinder length so disk sits flush on floor
 
         request = SpawnEntity.Request()
         request.name = 'target_mark'
