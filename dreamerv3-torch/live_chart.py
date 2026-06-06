@@ -87,10 +87,10 @@ def animate_blackbox(i):
     _last_drawn_episode[0] = current_ep
 
     titles = ['Success Rate (%)', 'Collision Rate (%)',
-              'Steps to Goal', 'Path Efficiency',
+              'Steps to Goal', 'Path Directness',
               'Min Obstacle Distance', 'Near Collisions']
     keys   = ['success_rate', 'collision_rate',
-              'steps_to_goal', 'path_efficiency',
+              'steps_to_goal', 'path_directness',
               'min_obstacle_dist', 'near_collisions']
     colors = ['green', 'red', 'blue', 'orange', 'purple', 'brown']
 
