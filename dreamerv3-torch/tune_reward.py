@@ -259,6 +259,12 @@ def suggest_weights(trial):
 def make_objective(args, csv_dir, baseline_success, study_name):
     import optuna
 
+    # Stop the study after this many *consecutive* crashed-with-no-data trials —
+    # a hard env/hardware failure (GPU drop, OOM, Gazebo death) won't self-heal,
+    # so without this a flaky eGPU silently burns every trial as FAILED_SCORE.
+    MAX_CRASH_STREAK = 2
+    crash_streak = [0]
+
     def objective(trial):
         # Re-check the sim before every trial: a mid-study Gazebo/DDS-discovery
         # failure would otherwise let each trial hang for the full --timeout-per-trial
@@ -294,10 +300,28 @@ def make_objective(args, csv_dir, baseline_success, study_name):
             trial.set_user_attr("efficiency", FAILED_SCORE)
             trial.set_user_attr("success", None)
             trial.set_user_attr("rc", rc)
-            print(f"[tune] trial {trial.number}: NO eval data (rc={rc}) "
-                  f"-> {FAILED_SCORE}", flush=True)
+            # rc != 0 with zero eval data = the subprocess crashed before any eval
+            # (e.g. "No CUDA GPUs are available" on an eGPU drop). Count consecutive
+            # such crashes and stop the study so a hardware/env failure can't burn
+            # every trial (resumable — fix the cause and re-run).
+            if rc != 0:
+                crash_streak[0] += 1
+                print(f"[tune] trial {trial.number}: CRASHED, no eval data (rc={rc}) "
+                      f"-> {FAILED_SCORE}  [crash streak {crash_streak[0]}/{MAX_CRASH_STREAK}]",
+                      flush=True)
+                if crash_streak[0] >= MAX_CRASH_STREAK:
+                    print(f"[tune] {crash_streak[0]} consecutive trials crashed with no "
+                          "data. Stopping study — likely a GPU/Gazebo/env failure (check "
+                          "`nvidia-smi`, `torch.cuda.is_available()`, the eGPU/Thunderbolt "
+                          "link, or RAM). Fix it and re-run the same command to resume.",
+                          flush=True)
+                    trial.study.stop()
+            else:
+                print(f"[tune] trial {trial.number}: NO eval data (rc={rc}) "
+                      f"-> {FAILED_SCORE}", flush=True)
             return FAILED_SCORE
 
+        crash_streak[0] = 0     # a scorable trial means the env recovered
         partial = (rc != 0)  # timed out or non-zero exit, but partial data exists
         # Constraint c <= 0 is feasible.  c = (floor) - success.
         floor = (baseline_success - args.margin) if baseline_success is not None else 0.0
