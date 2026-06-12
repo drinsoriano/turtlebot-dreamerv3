@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Bayesian optimization of reward-shaping weights for the shaped reward mode.
 
-This is a STANDALONE orchestration script. It does NOT modify reward, observation
-space, odometry modes, the DreamerV3 architecture, the A* metric, the dashboard, or
-torch/CUDA. Each Optuna trial simply launches ``dreamer.py`` as a subprocess with a
-candidate set of ``--reward_*`` flags, waits for training to finish, and scores the
-run by parsing the eval CSVs it produced.
+This is a STANDALONE orchestration script. It does NOT modify the reward/observation
+implementation, the odometry-mode implementation, the DreamerV3 architecture, the A*
+metric, the dashboard, or torch/CUDA. Each Optuna trial simply launches ``dreamer.py``
+as a subprocess with a candidate set of ``--reward_*`` flags, waits for training to
+finish, and scores the run by parsing the eval CSVs it produced.
+
+The observation space the weights are tuned under is selectable via ``--odometry-mode``
+(default ``none``). Because the obs space materially changes what the policy can learn,
+reward weights tuned under ``none`` may not be optimal under ``full_imu``; tune under the
+mode you will deploy. A non-``none`` mode namespaces the study/db/CSV/plots folders by
+mode (e.g. ``tune_stage1_full_imu``), so ``none`` and ``full_imu`` studies never collide.
 
 Objective (constrained efficiency):
     maximize  eval planner_path_efficiency
@@ -128,7 +134,7 @@ def build_command(args, logdir, reward_mode, weights):
         "--logdir", str(logdir),
         "--stage", str(args.stage),
         "--lidar", "360",
-        "--odometry_mode", "none",
+        "--odometry_mode", args.odometry_mode,
         "--seed", str(args.seed),
         "--device", args.device,
         "--steps", str(args.steps),
@@ -322,6 +328,11 @@ def main():
     p.add_argument("--stage", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--odometry-mode", default="none",
+                   help="obs space to tune the reward weights under (none/twist/delta/"
+                        "full/full_imu; default none). Non-none namespaces the study/db/"
+                        "CSV/plots by mode (e.g. tune_stage{N}_full_imu) so studies don't "
+                        "collide. Forwarded to dreamer.py as --odometry_mode.")
     p.add_argument("--steps", type=int, default=80000,
                    help="proxy training budget per trial (>=80000 so SCORE_WINDOW=60 "
                         "lands on the last 3 trained evals, skipping the untrained eval)")
@@ -356,12 +367,16 @@ def main():
                    help="print the dreamer.py commands without launching anything")
     args = p.parse_args()
 
-    study_name = args.study_name or f"reward_stage{args.stage}"
-    storage = args.storage or f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}.db'}"
+    # Namespace the study/db/CSV/plots by odometry mode so tuning under different
+    # obs spaces (e.g. none vs full_imu) never share a study or folder. Empty suffix
+    # for 'none' keeps existing none-study names/dbs/folders backward-compatible.
+    mode_suffix = "" if args.odometry_mode == "none" else f"_{args.odometry_mode}"
+    study_name = args.study_name or f"reward_stage{args.stage}{mode_suffix}"
+    storage = args.storage or f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}{mode_suffix}.db'}"
     if args.csv_dir is None:
-        args.csv_dir = f"./csv_logs/tune_stage{args.stage}"  # contain the trial CSVs
+        args.csv_dir = f"./csv_logs/tune_stage{args.stage}{mode_suffix}"  # contain the trial CSVs
     if args.plots_dir is None:
-        args.plots_dir = f"./path_plots/tune_stage{args.stage}"  # mirror csv_dir structure
+        args.plots_dir = f"./path_plots/tune_stage{args.stage}{mode_suffix}"  # mirror csv_dir structure
     # absolute path used for reading/scoring; dreamer.py writes to the same (cwd=THIS_DIR)
     csv_dir = args.csv_dir if os.path.isabs(args.csv_dir) else os.path.join(THIS_DIR, args.csv_dir)
 

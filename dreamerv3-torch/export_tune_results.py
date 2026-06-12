@@ -70,19 +70,24 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", type=int, default=1)
+    ap.add_argument("--odometry-mode", default="none",
+                    help="match the tune_reward.py run's mode (default none); non-none "
+                         "uses the mode-namespaced study/db/csv (e.g. tune_stage{N}_full_imu)")
     ap.add_argument("--study-name", default=None,
-                    help="default: reward_stage{stage}")
+                    help="default: reward_stage{stage}[_{mode}]")
     ap.add_argument("--storage", default=None,
-                    help="default: sqlite:///tune_reward_stage{stage}.db in this dir")
+                    help="default: sqlite:///tune_reward_stage{stage}[_{mode}].db in this dir")
     ap.add_argument("--csv-dir", default=None,
-                    help="default: ./csv_logs/tune_stage{stage}")
+                    help="default: ./csv_logs/tune_stage{stage}[_{mode}]")
     args = ap.parse_args()
 
-    study_name = args.study_name or f"reward_stage{args.stage}"
+    # Mirror tune_reward.py's mode namespacing (empty suffix for none).
+    mode_suffix = "" if args.odometry_mode == "none" else f"_{args.odometry_mode}"
+    study_name = args.study_name or f"reward_stage{args.stage}{mode_suffix}"
     storage = args.storage or \
-        f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}.db'}"
+        f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}{mode_suffix}.db'}"
     csv_dir = pathlib.Path(
-        args.csv_dir or (THIS_DIR / "csv_logs" / f"tune_stage{args.stage}"))
+        args.csv_dir or (THIS_DIR / "csv_logs" / f"tune_stage{args.stage}{mode_suffix}"))
     csv_dir.mkdir(parents=True, exist_ok=True)
 
     study = optuna.load_study(study_name=study_name, storage=storage)

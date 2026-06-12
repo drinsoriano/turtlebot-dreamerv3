@@ -892,8 +892,10 @@ def _section_bo_trials(df: pd.DataFrame):
     if df.empty:
         st.info(
             "No BO trial data found. Switch the sidebar folder to a "
-            "`tune_stage{N}/` subfolder, or run:\n\n"
-            "`python3 export_tune_results.py --stage N`"
+            "`tune_stage{N}/` subfolder (or `tune_stage{N}_{mode}/` for a "
+            "non-`none` odometry-mode study, e.g. `tune_stage1_full_imu`), or run:\n\n"
+            "`python3 export_tune_results.py --stage N` "
+            "(add `--odometry-mode full_imu` for a mode-specific study)"
         )
         return
 
@@ -1714,12 +1716,13 @@ python3 export_tune_results.py --stage 1
         ("--eval-episode-num",  "20",                       "eval episodes per trial"),
         ("--seed",              "0",                        "RNG seed"),
         ("--device",            "cuda",                     "training device"),
+        ("--odometry-mode",     "none",                     "obs space to tune under; non-none namespaces study/db/csv by mode (e.g. tune_stage{N}_full_imu)"),
         ("--margin",            "5.0",                      "allowed success drop vs baseline (pts)"),
         ("--timeout-per-trial", "86400",                    "sec (24 h); a timed-out trial is scored on partial data"),
         ("--run-baseline",      "(flag)",                   "run the default-reward baseline (sets the floor)"),
         ("--baseline-success",  "None",                     "skip baseline; give the floor success % directly"),
-        ("--csv-dir",           "./csv_logs/tune_stage{N}", "per-stage CSV subfolder"),
-        ("--study-name",        "reward_stage{N}",          "Optuna study + db name"),
+        ("--csv-dir",           "./csv_logs/tune_stage{N}[_{mode}]", "per-stage CSV subfolder (mode-suffixed if non-none)"),
+        ("--study-name",        "reward_stage{N}[_{mode}]", "Optuna study + db name (mode-suffixed if non-none)"),
         ("--dry-run",           "(flag)",                   "print the dreamer.py commands only; no training"),
     ], columns=["flag", "default", "notes"])
     st.dataframe(bo_params, width="stretch", hide_index=True, key="cmd_params_bo")
