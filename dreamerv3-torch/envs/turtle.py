@@ -57,7 +57,8 @@ class Env(Node):
                  odometry_mode='none', device='cpu', resource_logging=False,
                  reward_mode='default', reward_progress_scale=1.0,
                  reward_step_penalty=0.01, reward_turn_penalty=0.01,
-                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
+                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                 csv_dir='./csv_logs', plots_dir='./path_plots'):
         super().__init__("trainer_node")
 
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -76,7 +77,8 @@ class Env(Node):
                              device, resource_logging,
                              reward_mode, reward_progress_scale,
                              reward_step_penalty, reward_turn_penalty,
-                             reward_near_obstacle_scale, reward_near_obstacle_sigma)
+                             reward_near_obstacle_scale, reward_near_obstacle_sigma,
+                             csv_dir, plots_dir)
 
     def pause_simulation(self):
         try:
@@ -102,7 +104,8 @@ class Env(Node):
                         odometry_mode='none', device='cpu', resource_logging=False,
                         reward_mode='default', reward_progress_scale=1.0,
                         reward_step_penalty=0.01, reward_turn_penalty=0.01,
-                        reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
+                        reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                        csv_dir='./csv_logs', plots_dir='./path_plots'):
         self.num_states = 14
         self.num_actions = 2
         self.action_upper_bound = .25
@@ -147,10 +150,11 @@ class Env(Node):
         # - resume logic: if the CSV already exists, counters are seeded from it so that
         #   episode numbering and cumulative rates continue smoothly after a restart
         # - mode routing: train env → blackbox_{run_name}.csv, eval env → blackbox_eval_{run_name}.csv
-        os.makedirs('./csv_logs', exist_ok=True)
-        bb_path = (f'./csv_logs/blackbox_{run_name}.csv'
+        self.csv_dir = csv_dir
+        os.makedirs(csv_dir, exist_ok=True)
+        bb_path = (f'{csv_dir}/blackbox_{run_name}.csv'
                    if mode == 'train'
-                   else f'./csv_logs/blackbox_eval_{run_name}.csv')
+                   else f'{csv_dir}/blackbox_eval_{run_name}.csv')
         bb_exists = os.path.exists(bb_path)
         self._outcome_history = deque(maxlen=500)
         if bb_exists:
@@ -185,6 +189,7 @@ class Env(Node):
                 'success_rate', 'collision_rate',
                 'rolling_success_rate_100', 'rolling_collision_rate_100',
                 'rolling_success_rate_500', 'rolling_collision_rate_500',
+                'episode_steps',
             ])
         self._bb_file.flush()
 
@@ -194,7 +199,9 @@ class Env(Node):
         _pl_name = run_name if mode == 'train' else f'eval_{run_name}'
         self._init_planning_csv(_pl_name)
 
-        # Path plot subfolder routing: eval plots go to {run_name}_eval/ to avoid mixing
+        # Path plot base dir + subfolder routing: eval plots go to {run_name}_eval/
+        self._plots_dir = plots_dir
+        os.makedirs(plots_dir, exist_ok=True)
         self._plot_run_name = run_name if mode == 'train' else f'{run_name}_eval'
 
         # Resource-cost logger (optional, enabled via --resource_logging True)
@@ -210,6 +217,7 @@ class Env(Node):
                 odometry_mode=self.odometry_mode,
                 device=device,
                 lidar=self.lidar,
+                csv_dir=csv_dir,
             )
 
         # Reward shaping (opt-in via reward_mode='shaped'; 'default' = original sparse reward)
@@ -226,8 +234,8 @@ class Env(Node):
         # Reward-components CSV — per-episode component sums (always written, both modes;
         # in 'default' mode the shaping columns are all 0 and sum_total == sum_terminal).
         # mode routing: train → reward_{run_name}.csv, eval → reward_eval_{run_name}.csv
-        rw_path = (f'./csv_logs/reward_{run_name}.csv' if mode == 'train'
-                   else f'./csv_logs/reward_eval_{run_name}.csv')
+        rw_path = (f'{csv_dir}/reward_{run_name}.csv' if mode == 'train'
+                   else f'{csv_dir}/reward_eval_{run_name}.csv')
         rw_exists = os.path.exists(rw_path)
         self._rw_file = open(rw_path, 'a', newline='')
         self._rw_writer = csv.writer(self._rw_file)
@@ -409,13 +417,14 @@ class Env(Node):
             round(self.collision_count / self.episode_count * 100, 2),
             rs100, rc100,
             rs500, rc500,
+            self.step_counter,   # episode_steps: total steps this episode (all outcomes)
         ])
         self._bb_file.flush()
 
     # ── Planning CSV (A* path efficiency) ─────────────────────────────────────
 
     def _init_planning_csv(self, run_name: str) -> None:
-        pl_path = f'./csv_logs/planning_{run_name}.csv'
+        pl_path = f'{self.csv_dir}/planning_{run_name}.csv'
         pl_exists = os.path.exists(pl_path)
         self._pl_file = open(pl_path, 'a', newline='')
         self._pl_writer = csv.writer(self._pl_file)
@@ -521,6 +530,7 @@ class Env(Node):
                     run_name=self._plot_run_name,
                     efficiency=reg_capped if reg_status == 'ok' else '',
                     efficiency_center=cen_capped if cen_status == 'ok' else '',
+                    plots_dir=self._plots_dir,
                 )
             except Exception:
                 pass
@@ -621,6 +631,9 @@ class Env(Node):
             outcome = ('success' if distance < REACH_TRESHOLD
                        else 'collision' if np.min(lidar_32) < COLISION_TRESHOLD
                        else 'timeout')
+            # Surfaced to simulate() via Turtle.step info for correct eval-rate
+            # accounting (reward-mode-independent; separates timeout from collision).
+            self.last_outcome = outcome
             self._rw_writer.writerow([
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 self.reward_mode, self.stage, self.episode_number, outcome,
@@ -765,6 +778,48 @@ class Env(Node):
                 (-1.5, 1.5), (1.5, 1.5), (-0.2, 1.5), (-1, 1.5), (-5.0, 1.5)
             ]
             return random.choice(points)
+        # ── Stages 7 and 8 ─────────────────────────────────────────────────────
+        # Stage 7: 5×5 m arena (same outer walls as stages 1–4), six inner walls.
+        # Wall positions (from obstacles_stage7/model.sdf, confirmed in stage_map.py):
+        #   w1 horizontal at (-1.0, -1.5)  → blocks x∈[-1.5,-0.5], y≈-1.5
+        #   w2 vertical   at ( 0.5, -1.0)  → blocks x≈ 0.5, y∈[-1.5,-0.5]
+        #   w3 vertical   at ( 1.5, -0.5)  → blocks x≈ 1.5, y∈[-1.0, 0.0]
+        #   w4 vertical   at (-1.5,  1.0)  → blocks x≈-1.5, y∈[ 0.5, 1.5]
+        #   w5 horizontal at (-0.5,  0.5)  → blocks x∈[-1.0, 0.0], y≈ 0.5
+        #   w6 vertical   at ( 0.0,  1.5)  → blocks x≈ 0.0, y∈[ 1.0, 2.0]
+        # Points are placed in open areas, all ≥ 0.8 m from origin (MIN_GOAL_DIST).
+        elif self.stage == 7:
+            points = [
+                # bottom strip (y = -2.0)
+                (-2.0, -2.0), (-1.0, -2.0), (0.0, -2.0), (1.0, -2.0), (2.0, -2.0),
+                # y = -1.5: skip x ∈ [-1.5, -0.5] (w1) and x ≈ 0.5 (w2)
+                (-2.0, -1.5), (0.0, -1.5), (1.0, -1.5), (2.0, -1.5),
+                # y = -1.0: skip x ≈ 0.5 (w2)
+                (-2.0, -1.0), (-1.0, -1.0), (1.0, -1.0), (2.0, -1.0),
+                # y = -0.5: skip x ≈ 0.5 (w2) and x ≈ 1.5 (w3)
+                (-2.0, -0.5), (-1.0, -0.5), (1.0, -0.5), (2.0, -0.5),
+                # y = 0.0: skip x ≈ 1.5 (w3)
+                (-2.0, 0.0), (-1.0, 0.0), (1.0, 0.0), (2.0, 0.0),
+                # y = 0.5: skip x ∈ [-1.0, 0.0] (w5) and x ≈ 1.5 (w3)
+                (-2.0, 0.5), (1.0, 0.5), (2.0, 0.5),
+                # y = 1.0: skip x ≈ -1.5 (w4)
+                (-2.0, 1.0), (-0.5, 1.0), (1.0, 1.0), (2.0, 1.0),
+                # y = 1.5: skip x ≈ -1.5 (w4) and x ≈ 0.0 (w6)
+                (-2.0, 1.5), (-0.5, 1.5), (0.5, 1.5), (2.0, 1.5),
+                # top strip (y = 2.0): skip x ≈ 0.0 (w6)
+                (-2.0, 2.0), (-1.0, 2.0), (0.5, 2.0), (1.0, 2.0), (2.0, 2.0),
+            ]
+            return random.choice(points)
+        # Stage 8: 7.5×7.5 m empty arena (outer_walls_stage5; no inner obstacles).
+        # Uses the same outer walls as stage 5; sampling range matches stage 5's
+        # maximum extent (±3.0 m) leaving a comfortable margin from the ±3.625 m walls.
+        elif self.stage == 8:
+            return (random.uniform(-3.00, 3.00), random.uniform(-3.00, 3.00))
+        else:
+            raise ValueError(
+                f"Stage {self.stage} is not a recognised training stage. "
+                "Supported stages are 1–8. Check --stage and the Gazebo launch file."
+            )
 
     def generate_random_target_position(self):
         # Robot always resets to (0.0, 0.0) via /reset_simulation.
@@ -807,13 +862,15 @@ class Turtle(gym.Env):
                  odometry_mode='none', device='cpu', resource_logging=False,
                  reward_mode='default', reward_progress_scale=1.0,
                  reward_step_penalty=0.01, reward_turn_penalty=0.01,
-                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25):
+                 reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                 csv_dir='./csv_logs', plots_dir='./path_plots'):
         super(Turtle, self).__init__()
         self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
                         device, resource_logging,
                         reward_mode, reward_progress_scale,
                         reward_step_penalty, reward_turn_penalty,
-                        reward_near_obstacle_scale, reward_near_obstacle_sigma)
+                        reward_near_obstacle_scale, reward_near_obstacle_sigma,
+                        csv_dir, plots_dir)
 
         self.observation_space = spaces.Dict({
             'sensor_readings': spaces.Box(low=np.zeros(lidar, dtype=np.float32),
@@ -867,7 +924,10 @@ class Turtle(gym.Env):
             result['log_success_rate'] = float(getattr(self._env, 'log_success_rate', 0))
             result['log_collision_rate'] = float(getattr(self._env, 'log_collision_rate', 0))
 
-        return result, reward, done, {'discount': 0.99}
+        info = {'discount': 0.99}
+        if done:
+            info['outcome'] = getattr(self._env, 'last_outcome', None)
+        return result, reward, done, info
 
     def reset(self):
         obs = self._env.reset()

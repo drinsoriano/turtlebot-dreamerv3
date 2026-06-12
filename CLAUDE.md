@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TurtleBot3 autonomous navigation using DreamerV3 (model-based RL). The robot receives LiDAR observations in a Gazebo simulation (ROS2) and learns to reach randomly-spawned goals while avoiding obstacles. Eight training stages increase in obstacle complexity.
 
+**Stage coverage: 1–8 (fully supported).** The goal sampler `_sample_target_position` in `envs/turtle.py` defines start/goal layouts for stages 1–8 (stages 7 and 8 added 2026-06-09; unknown stage → `ValueError`), and the A* arena geometry (`STAGE_ARENAS` in `envs/stage_map.py`) covers 1–8. Each stage needs its own Gazebo launch file (`turtle_stage{N}.py`) and a matching `--stage N`. A thesis-ready methodology and supporting docs live under `docs/` (`methodology.md`, `implementation_audit.md`, `whitebox_data_validation.md`, etc.).
+
 Active development spans three branches: `reward-shaping` (current — reward-shaping experiments), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
 
 ## Project Branches
@@ -97,6 +99,8 @@ Columns: `datetime, stage, episode, outcome, start_x, start_y, target_x, target_
 
 Numeric fields are **blank (empty string)** for non-`ok` rows — never `-1.0` — so pandas/CSV tools treat them as NaN naturally.
 
+**Robot footprint (obstacle inflation) — A\* is not a point robot.** `build_grid` in `stage_map.py` inflates every obstacle **and** the outer walls by `ROBOT_RADIUS = 0.15 m` (= TurtleBot3 Burger footprint ≈ `0.105 m` + `0.045 m` safety margin) at `RESOLUTION = 0.05 m` per cell — the standard configuration-space (Minkowski) approach. So A\* keeps the robot **centre ≥ 0.15 m** from any obstacle and routes through a gap **only if it is wider than ~0.30 m** (2 × radius). Because `0.15 m > ` the real ~`0.105 m` radius, **A\* is more conservative than the physical robot**: any path A\* finds is physically followable (with ~0.045 m clearance), and A\* will **never** squeeze through a gap the robot cannot. In tight layouts (e.g. narrow stage-4 corridors) a passage between ~0.21 m and ~0.30 m is fittable by the real robot but declined by A\* → that episode logs `planner_status = no_path` with blank efficiency (honest missing data, **not** a wrong value, and never an over-optimistic one). To make A\* match the robot more exactly, lower `ROBOT_RADIUS` toward `0.105 m`; the conservative default is preferred so the planned path is guaranteed feasible.
+
 ## Reward Shaping (branch: `reward-shaping`)
 
 **Goal:** Improve navigation path efficiency across all stages — reduce looping, wandering, and overshooting behavior without breaking success rate.
@@ -149,13 +153,87 @@ Compare against a no-shaping baseline run on this branch for the same stage (not
 - Secondary: `path_directness` from `blackbox_{run_name}.csv`
 - Guard: `success_rate` and `collision_rate` must not regress
 
+### Reward-Weight Tuning (Bayesian Optimization)
+
+`dreamerv3-torch/tune_reward.py` searches the five `shaped`-mode weights with Optuna. It is a **standalone orchestration script** — it launches `dreamer.py` as a subprocess with candidate `--reward_*` flags and scores each run from the eval CSVs. It does **not** modify reward/observation/odometry/architecture/A\*/dashboard/torch. **A\* is used only as the scoring metric, never fed into training.**
+
+- **Objective (constrained efficiency):** maximize eval `planner_path_efficiency` subject to eval `success_rate ≥ baseline_success − margin` (default margin 5 pts). Constraint handled via `TPESampler(constraints_func=...)`.
+- **Fidelity:** short proxy budget per trial (`--steps 80000 --eval_episode_num 20`), then validate the winner at full budget. Trials run **sequentially** (one Gazebo, one GPU). At the default `eval_every = 20000`, an **80k** trial yields **5 evals → ~100 eval episodes**, and `SCORE_WINDOW = 60` scores the **last 3 evals** (the 40k/60k/80k checkpoints), excluding the untrained `ctr=0` eval. **Use `--steps ≥80000` for BO:** a 40k trial has only 3 evals (60 rows), so the 60-row window would reach the untrained `ctr=0` eval and pollute the score (for short trials, lower `SCORE_WINDOW`). `tune_reward.py` does not expose `--eval_every`, so trials use the config default. See [docs/evaluation_loop.md](docs/evaluation_loop.md).
+- **Persistence:** study saved to `tune_reward_stage{N}.db` (sqlite, gitignored) with `load_if_exists=True` — a crash/reboot resumes the study.
+
+**`tune_reward.py` does not replace `dreamer.py` — it wraps it.** Each trial builds and runs a normal `dreamer.py ... --reward_mode shaped` command with the five `--reward_*` flags chosen by Optuna. A plain `dreamer.py` run (no weight flags) is still the way to do smoke tests, the baseline, and final validation.
+
+#### How to run the BO search
+
+Needs **two terminals**.
+
+**Terminal 1 — start Gazebo once** (stays up for the entire study; the stage is fixed):
+```bash
+export TURTLEBOT3_MODEL=burger
+ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py
+```
+
+**Terminal 2 — run the tuner:**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+# (optional) preview the exact dreamer.py commands — no training, no Gazebo needed
+python3 tune_reward.py --stage 1 --n-trials 2 --dry-run
+
+# 1) default-reward baseline → sets the success-rate constraint floor
+python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20
+
+# 2) the search: 30 trials, each an 80k-step run with Optuna-chosen weights
+#    (auto-runs a baseline first if --baseline-success is not given)
+python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 20
+```
+
+> **Why `--steps 80000` (not 40k):** with `eval_every = 20000` and `SCORE_WINDOW = 60`,
+> an 80k trial has 5 evals (100 rows) and the score uses the **last 3 trained evals**
+> (40k/60k/80k), excluding the untrained `ctr=0` eval. A 40k trial has only 3 evals
+> (60 rows), so the 60-row window would include the untrained eval — use ≥80k for BO,
+> or lower `SCORE_WINDOW` for shorter trials.
+It prints the best **feasible** config (efficiency, success, and each `--reward_*` value). If the study crashes or the machine reboots, re-run the **same** step-2 command — it resumes from where it stopped, not from trial 0.
+
+Key flags: `--stage`, `--n-trials`, `--steps` (default **80000**), `--eval-episode-num`, `--eval-every` (forwarded to `dreamer.py`; default: omit → config default 20000; **lower it, e.g. 2000, for a fast smoke test**), `--seed`, `--margin` (allowed success drop, pts), `--timeout-per-trial` (sec, default **24 h** so a trial is never cut off unnoticed; a trial exceeding it is stopped and **scored on its partial eval data**, not discarded), `--run-baseline`, `--baseline-success <pct>` (skip the baseline run), `--logdir-root` (base for trial logdirs, default `./logdir` → trials land in `{logdir-root}/{study_name}/{study_name}_trial{NN}`), `--csv-dir` (default `./csv_logs/tune_stage{N}`), `--study-name` (default `reward_stage{N}`), `--dry-run`.
+
+> **Per-trial budget reality:** a 40k-step trial takes ~140 min on this machine, so an **80k** trial (the recommended BO budget, see above) is ~280 min (~4.7 h); the timeout now defaults to **24 h** so a trial is never cut off unnoticed (no need to raise it for larger `--steps`; lower only for a hard cap). Trial logdirs are namespaced per study (`logdir/{study_name}/{study_name}_trial{NN}`), so re-runs never resume a stale checkpoint. The baseline is idempotent — it is reused if already scored, not re-trained.
+
+> **CSV organization:** each trial emits ~9 CSVs, so trials write to a **per-stage subfolder** `csv_logs/tune_stage{N}/` (via `--csv-dir`, default `./csv_logs/tune_stage{stage}`) instead of flooding the main `csv_logs/`. Main/manual/validation runs keep writing to `csv_logs/`. The Streamlit dashboard has a **CSV-folder picker** in the sidebar to switch between `csv_logs/` (main runs, default) and any `tune_stage{N}/` subfolder.
+
+> **Sanity test before a full study:** verify the full pipeline (Gazebo → subprocess → CSV scoring) with a short run before committing to 30 real trials. Pass a small `--eval-every` so each trial actually finishes fast (without it, the default 20000-step round makes even a 3k-step trial train a full round). Use `--study-name smoke` to isolate from the real study and `--logdir-root` so the output folder is obvious:
+> ```bash
+> python3 tune_reward.py --stage 1 --n-trials 2 --steps 4000 --eval-episode-num 2 \
+>   --eval-every 2000 --study-name smoke --logdir-root ./logdir
+> ```
+> Trials land in `./logdir/smoke/smoke_trial000`, `…_trial001` (and `smoke_baseline_seed0` if a baseline runs); CSVs in `./csv_logs/tune_stage{N}/`. Delete the smoke artifacts before starting the real study — smoke logdirs, CSVs, and the db file are not reused by the real study (different `--study-name`), but cleaning up avoids confusion:
+> ```bash
+> rm -f tune_reward_stage1.db
+> rm -rf logdir/smoke/ csv_logs/tune_stage1/
+> ```
+
+**Validation protocol (declares the winner):** take the printed weights and re-run at **full budget** with `dreamer.py` directly — 3 seeds on stage 1, then stages 2–4 with the same weights to test transfer:
+```bash
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage1_360_none_seed0_reward_tuned \
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode shaped \
+  --reward_progress_scale <v> --reward_step_penalty <v> --reward_turn_penalty <v> \
+  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
+```
+A single 40k proxy trial only *ranks* configs; the full-budget multi-seed run *confirms* the winner.
+
+**Caveat — stage-1 over-fitting:** stage 1 is nearly obstacle-free, so weights tuned there can favor an aggressive progress reward that fails on cluttered stages. The progress search range is capped (0.1–3.0) and cross-stage validation is mandatory; if transfer is poor, re-tune on a cluttered stage (`--stage 3`).
+
 ## Path Plots
 
 PNG overhead plots are generated per episode under `dreamerv3-torch/path_plots/{run_name}/`.
 
 **Filename pattern:** `ep{episode:05d}_{outcome}.png` (e.g. `ep00001_timeout.png`, `ep00042_success.png`)
-
-**Generated whenever:** A* returns a valid path and the episode ends (success / collision / timeout). No toggle flag — always on. Disable during long training runs if I/O becomes a bottleneck.
+/
+` DFT6YGHJJKL;P[]
+**+-Generated whenever:** A* returns a valid path and the episode ends (success / collision / timeout). No toggle flag — always on. Disable during long training runs if I/O becomes a bottleneck.
 
 **Each plot shows:**
 - Stage arena boundary and physical obstacle outlines (from `stage_map.py` geometry)
@@ -186,8 +264,14 @@ The preferred monitoring tool is the Streamlit dashboard:
 cd ~/turtlebot-dreamerv3/dreamerv3-torch/dashboard
 streamlit run app.py
 ```
++-
+- 
 
-`live_chart.py` is no longer used.
++-'[]
+*
+live_chart.py` is no longer used.
+
+Every `st.plotly_chart` / `st.dataframe` in the per-run sections (`_section_resource`, `_section_planner`) and the combined sections (`_section_bb`, `_section_wb`) passes a unique `key=` (e.g. `res_{run_name}_{y_col}`, `plan_{run_name}`, `bb_{col}`, `wb_{title}`). This avoids `StreamlitDuplicateElementId` when multiple runs are selected and rendered in a loop — **add a unique `key=` to any new chart/table** you introduce in those loops.
 
 ## Gazebo Launch Notes
 
@@ -246,10 +330,11 @@ Expected: numpy 2.x, matplotlib from `~/.local/`, CUDA True, RTX 5060 Ti.
 - More impactful levers:
   - `--device cuda` — GPU training
   - `--eval_episode_num N` — fewer eval episodes per checkpoint = less wall-clock pause
-  - `--eval_every N` — less frequent evaluation
+  - `--eval_every N` — the **evaluation interval in steps** (default `20000` = eval every 20k). Evaluation runs **once per `eval_every` steps** — `eval_every` is the single control (the hardcoded `% 4` multiplier was removed 2026-06-12; see [docs/evaluation_loop.md](docs/evaluation_loop.md)). **Lower** it (e.g. `--eval_every 5000`) for a finer learning curve; **raise** it for fewer eval pauses.
 - **`eval_episode_num` guidance:**
   - `2` — smoke test / fast iteration only
   - `100` — preferred for real training and final result reporting
+- **Eval overhead on long runs:** at the default `eval_every = 20000`, a 300k run is ~16 evals and a 600k run is ~31 evals. At `--eval_episode_num 100` that is ~1,600–3,100 eval episodes (and eval path-plots). Cut it further with a smaller `--eval_episode_num` and/or a larger `--eval_every`; conversely, lower `--eval_every` for a finer curve on short runs.
 
 ## Example Commands
 
@@ -264,27 +349,49 @@ python3 dreamer.py \
   --device cuda --steps 5000 --eval_episode_num 2
 ```
 
-**GPU training (any stage N):**
+**GPU training — default reward (original sparse reward, baseline):**
 ```bash
 cd ~/turtlebot-dreamerv3/dreamerv3-torch
 
 python3 dreamer.py \
   --configs turtle --task turtle \
-  --logdir ./logdir/stage{n}_360_none_seed0 \
-  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
-  --device cuda --steps 300000 --eval_episode_num 100
-```
-
-**GPU training with resource-cost logging:**
-```bash
-cd ~/turtlebot-dreamerv3/dreamerv3-torch
-
-python3 dreamer.py \
-  --configs turtle --task turtle \
-  --logdir ./logdir/stage{n}_360_none_seed0 \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_default \
   --stage {n} --lidar 360 --odometry_mode none --seed 0 \
   --device cuda --steps 300000 --eval_episode_num 100 \
-  --resource_logging True
+  --reward_mode default
+```
+
+**GPU training — shaped reward:**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+python3 dreamer.py \
+  --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_shaped \
+  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode shaped
+```
+
+**GPU training — shaped reward with tuned weights (post-BO validation):**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+python3 dreamer.py \
+  --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_tuned \
+  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode shaped \
+  --reward_progress_scale <v> --reward_step_penalty <v> --reward_turn_penalty <v> \
+  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
+```
+
+Resource logging is **on by default** (`resource_logging: true` in `configs.yaml`) — no flag needed. To disable: add `--resource_logging False`.
+
+Custom CSV output directory (e.g. to keep BO validation runs separate from tune trials):
+```bash
+  --csv_dir ./csv_logs/my_experiment
 ```
 
 Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, or `full` as needed.
@@ -299,6 +406,7 @@ Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, or
   - `install/` — install artifacts
   - `log/` — ROS2/system log output
   - `*.pt`, `*.npz`, `*.jsonl`, `events.out.tfevents*`
+  - `*.db`, `*.db-journal` — Optuna sqlite study files (`tune_reward_stage{N}.db`)
 - Always run before committing:
   ```bash
   git status --short
@@ -353,7 +461,7 @@ Key turtle config values: `steps=600000`, `lidar=360`, `batch_size=16`, `batch_l
 
 ### CSV logging
 
-Seven CSV files per run, written under `dreamerv3-torch/csv_logs/`. Train and eval episodes are separated — main CSVs contain only training episodes; eval episodes go to parallel eval CSVs:
+Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.csv_dir`). Train and eval episodes are separated — main CSVs contain only training episodes; eval episodes go to parallel eval CSVs:
 
 | CSV file | Written by | Contents |
 |---|---|---|
@@ -362,20 +470,41 @@ Seven CSV files per run, written under `dreamerv3-torch/csv_logs/`. Train and ev
 | `whitebox_{run_name}.csv` | `Logger.write()` | Step-based algorithm metrics (always train) |
 | `planning_{run_name}.csv` | Train env | A* metrics for train episodes |
 | `planning_eval_{run_name}.csv` | Eval env | A* metrics for eval episodes |
-| `resource_{run_name}.csv` | Train env | Resource cost (if `--resource_logging True`) |
+| `reward_{run_name}.csv` | Train env | Per-episode reward component sums |
+| `reward_eval_{run_name}.csv` | Eval env | Reward component sums for eval episodes |
+| `resource_{run_name}.csv` | Train env | Resource cost (on by default; `--resource_logging False` to disable) |
 | `resource_eval_{run_name}.csv` | Eval env | Resource cost for eval (same flag) |
 
-**`blackbox_*` columns:** `datetime, odometry_mode, stage, episode, outcome, steps_to_goal, path_directness, min_obstacle_dist, near_collisions, success_rate, collision_rate, rolling_success_rate_100, rolling_collision_rate_100, rolling_success_rate_500, rolling_collision_rate_500`. Episode numbering and rolling-window counters in each CSV are independent — cumulative rates and rolling rates in `blackbox_eval_*` reflect eval-only performance across all checkpoints.
+**`blackbox_*` columns:** `datetime, odometry_mode, stage, episode, outcome, steps_to_goal, path_directness, min_obstacle_dist, near_collisions, success_rate, collision_rate, rolling_success_rate_100, rolling_collision_rate_100, rolling_success_rate_500, rolling_collision_rate_500, episode_steps`. Episode numbering and rolling-window counters in each CSV are independent — cumulative rates and rolling rates in `blackbox_eval_*` reflect eval-only performance across all checkpoints.
 
-**`whitebox_{run_name}.csv` columns:** `datetime, step, train_return, reward_variance, model_loss, actor_loss, value_loss, kl, prior_ent, post_ent, eval_return, eval_success_rate, eval_collision_rate`
+> **`steps_to_goal` vs `episode_steps`:** `steps_to_goal` is the step count for **successful** episodes only (`-1` for collision/timeout — kept for backward compatibility). `episode_steps` (added 2026-06-12) is the total step count for **every** outcome: for `collision` rows it is the **time-to-collision**, for `timeout` it is ~`max_steps` (250), and for `success` it equals `steps_to_goal`. Combined with `actual_path_length` (planning CSV) it gives per-episode average speed (`m/step`) for any outcome. Read it by column name — CSVs written before the column was added simply lack the field.
+
+**`whitebox_{run_name}.csv` columns:** `datetime, step, train_return, reward_variance, model_loss, actor_loss, value_loss, kl, prior_ent, post_ent, eval_return, eval_success_rate, eval_collision_rate, reward_variance_100, actor_entropy, model_grad_norm, actor_grad_norm, value_grad_norm, reward_loss, dyn_loss, rep_loss, ema_005, ema_095`
+
+> **Whitebox is interval-based** (one row per `log_every` steps — turtle default `2e3`), written only when `model_loss` is present; expect far fewer rows than the per-episode blackbox. Use it for the **learning** diagnostics (losses, KL, entropies, returns).
+>
+> **Diagnostics added 2026-06-12** (the last 10 columns; all were already computed in `models.py`, so **zero extra training cost** — they were simply not being persisted). Appended at the **end** of the row, so older CSVs and existing readers are unaffected (the columns are just absent in pre-2026-06-12 files; read by name). Key ones:
+> - **`actor_entropy`** — policy entropy. A collapse toward ~0 means the policy stopped exploring (a common cause of looping / getting stuck); the single most useful health signal. From [models.py](dreamerv3-torch/models.py) `actor_entropy`.
+> - **`model_grad_norm` / `actor_grad_norm` / `value_grad_norm`** — gradient L2 norms; sudden spikes flag training instability.
+> - **`reward_loss`** — isolated reward-head loss; if high, the world model can't predict reward and planning degrades. `dyn_loss` / `rep_loss` are the KL split (dynamics vs representation — posterior-collapse check).
+> - **`ema_005` / `ema_095`** — DreamerV3 return-normalization percentiles (reward-scale drift; matters under shaped reward). Sourced from the upper-case `EMA_005`/`EMA_095` metric keys.
+> - **`reward_variance_100`** — rolling last-100-episode reward variance. The original **`reward_variance` is cumulative (all-time)** and stays high forever because early-training chaos is never dropped; `reward_variance_100` is the honest "is it stable *now*?" signal. Both are kept.
+>
+> **`eval_success_rate` / `eval_collision_rate` (fixed 2026-06-09):** scored from the terminal **outcome label** (`tools.simulate` reads `info['outcome']` surfaced by `Turtle.step`), so they are correct under **shaped** reward and keep **timeout out of the collision count**. The old code compared episode reward to `100`/`-10`, which read `0` in shaped mode and folded timeouts into collisions. **For reported success/collision rates use `blackbox_eval_*` — it is the authoritative source in both reward modes.** CSVs logged before the fix (e.g. earlier tuner trials) still contain the buggy `0` values. See `docs/whitebox_data_validation.md`.
+
+**`reward_*` columns:** `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total`. Written in **both** modes — in `default` mode the shaping columns are `0` and `sum_total == sum_terminal`.
 
 **`planning_*` columns:** see **A* Planner-Based Path Efficiency** above; written on `planner-efficiency-metric` branch only.
 
 **Routing mechanism:** File routing is done at `init_properties()` time based on `mode` — no runtime mode guards inside write methods. Train env opens `blackbox_{run_name}.csv`; eval env opens `blackbox_eval_{run_name}.csv`. The same resume logic (seed counters from existing CSV on restart) applies to both.
 
-**Path plots:** Train episodes → `path_plots/{run_name}/`. Eval episodes → `path_plots/{run_name}_eval/`. Both are gitignored by `path_plots/`. Over a 300k-step run with 100 eval episodes per checkpoint this generates O(thousands) of eval PNGs — disable A* in eval by patching `_write_planning_csv` if I/O becomes a bottleneck.
+**Path plots:** Train episodes → `path_plots/{run_name}/`. Eval episodes → `path_plots/{run_name}_eval/`. Both are gitignored by `path_plots/`. Since eval fires every `eval_every` (default 20000) steps, a 300k-step run is ~16 eval checkpoints × `eval_episode_num` episodes — with `100` that is O(thousands) of eval PNGs. Reduce with a smaller `--eval_episode_num` / larger `--eval_every`, or disable A* in eval by patching `_write_planning_csv` if I/O becomes a bottleneck.
 
 `run_name` is derived from the final component of `--logdir` in `make_env()`.
+
+**CSV base directory:** all per-run CSVs are written under `config.csv_dir` (default `./csv_logs`, a config/CLI knob threaded through `make_env` → `Turtle` → `Env.init_properties` and `ResourceLogger`, **and into `tools.Logger` via `dreamer.py` for the whitebox CSV**). Only the base directory is configurable — the `{type}_{run_name}.csv` filenames, train/eval routing, and resume logic are unchanged. `tune_reward.py` sets `--csv_dir ./csv_logs/tune_stage{N}` so BO-trial CSVs stay in a per-stage subfolder; the dashboard's sidebar folder picker reads either `csv_logs/` or a subfolder.
+
+> **Whitebox now honours `csv_dir` (fixed 2026-06-09).** Previously `tools.Logger` hardcoded the whitebox path to `./csv_logs/whitebox_{run}.csv`, so it split from the other CSVs on `--csv_dir`-redirected (tuner) runs. It now writes `{csv_dir}/whitebox_{run}.csv`, co-located with blackbox/planning/reward/resource. **Files written before the fix stay where they were** — Python loads `tools.py` once per process, so a run already in flight keeps the old path until it restarts; only new/next subprocesses pick up the change.
 
 ## Key Variable Notes
 
@@ -392,7 +521,7 @@ Seven CSV files per run, written under `dreamerv3-torch/csv_logs/`. Train and ev
 
 ## Resource-Cost Logging
 
-Enabled via `--resource_logging True` (default `false`, zero overhead when off).
+Enabled by default (`resource_logging: true` in `configs.yaml`). Pass `--resource_logging False` to turn it off (zero overhead when off).
 Written to `dreamerv3-torch/csv_logs/resource_{run_name}.csv`, one row per episode.
 Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 
@@ -434,17 +563,3 @@ Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 - `depth` — depth camera (future)
 - `lidar_depth` — combined (future)
 - Depth camera and CNN integration are future work, separate from the current odometry ablation. Do not implement until explicitly scoped.
-
-
-Test commands (need Gazebo on stage 1)
-
-cd ~/turtlebot-dreamerv3/dreamerv3-torch
-python3 dreamer.py --configs turtle --task turtle \
-  --logdir ./logdir/stage1_360_none_seed0_reward_default \
-  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
-  --device cuda --steps 5000 --eval_episode_num 2 --reward_mode default
-
-python3 dreamer.py --configs turtle --task turtle \
-  --logdir ./logdir/stage1_360_none_seed0_reward_shaped \
-  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
-  --device cuda --steps 5000 --eval_episode_num 2 --reward_mode shaped

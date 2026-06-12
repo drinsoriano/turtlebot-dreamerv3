@@ -57,7 +57,7 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step, log_videos=True):
+    def __init__(self, logdir, step, log_videos=True, csv_dir='./csv_logs'):
             self._logdir = logdir
             self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
             self._last_step = None
@@ -71,15 +71,18 @@ class Logger:
             self._reward_history = []
             self._last_train_return = None
             self._last_reward_variance = None
+            self._last_reward_variance_100 = None
             self._last_eval_return = None
             self._last_eval_success_rate = None
             self._last_eval_collision_rate = None
 
-            # CSV Logger — White-box
+            # CSV Logger — White-box. Honours csv_dir so the whitebox CSV is
+            # co-located with the blackbox/planning/reward/resource CSVs for the
+            # same run (e.g. tuner runs land in csv_logs/tune_stage{N}/).
             import csv
-            os.makedirs('./csv_logs', exist_ok=True)
+            os.makedirs(csv_dir, exist_ok=True)
             run_name = str(self._logdir).split('/')[-1]
-            wb_path = f'./csv_logs/whitebox_{run_name}.csv'
+            wb_path = f'{csv_dir}/whitebox_{run_name}.csv'
             wb_exists = os.path.exists(wb_path)
             self._wb_file = open(wb_path, 'a', newline='')
             self._wb_writer = csv.writer(self._wb_file)
@@ -88,7 +91,15 @@ class Logger:
                     'datetime', 'step', 'train_return', 'reward_variance',
                     'model_loss', 'actor_loss', 'value_loss',
                     'kl', 'prior_ent', 'post_ent',
-                    'eval_return', 'eval_success_rate', 'eval_collision_rate'
+                    'eval_return', 'eval_success_rate', 'eval_collision_rate',
+                    # Added 2026-06-12 — diagnostics already computed in models.py
+                    # (zero extra training cost; appended so old readers/columns are
+                    # unaffected). reward_variance_100 = rolling-window stability;
+                    # the original reward_variance stays cumulative (all-time).
+                    'reward_variance_100', 'actor_entropy',
+                    'model_grad_norm', 'actor_grad_norm', 'value_grad_norm',
+                    'reward_loss', 'dyn_loss', 'rep_loss',
+                    'ema_005', 'ema_095',
                 ])
             self._wb_file.flush()
 
@@ -153,7 +164,19 @@ class Logger:
                 s.get('post_ent', ''),
                 self._last_eval_return if self._last_eval_return is not None else '',
                 self._last_eval_success_rate if self._last_eval_success_rate is not None else '',
-                self._last_eval_collision_rate if self._last_eval_collision_rate is not None else ''
+                self._last_eval_collision_rate if self._last_eval_collision_rate is not None else '',
+                # Diagnostics (blank if not yet computed this interval). Sourced
+                # by exact metric name from models.py; EMA keys are upper-case there.
+                self._last_reward_variance_100 if self._last_reward_variance_100 is not None else '',
+                s.get('actor_entropy', ''),
+                s.get('model_grad_norm', ''),
+                s.get('actor_grad_norm', ''),
+                s.get('value_grad_norm', ''),
+                s.get('reward_loss', ''),
+                s.get('dyn_loss', ''),
+                s.get('rep_loss', ''),
+                s.get('EMA_005', ''),
+                s.get('EMA_095', ''),
             ])
             self._wb_file.flush()
 
@@ -243,6 +266,7 @@ def simulate(
         obs, reward, done = zip(*[p[:3] for p in results])
         obs = list(obs)
         reward = list(reward)
+        infos = [p[3] for p in results]
         done = np.stack(done)
         episode += int(done.sum())
         length += 1
@@ -289,13 +313,20 @@ def simulate(
                     logger.scalar(f"train_episodes", len(cache))
                     
                     # Thesis whitebox — Reward Variance σ²R = 1/N × Σ(Ri - R̄)²
+                    # Two flavours: cumulative (all episodes — backward-compatible)
+                    # and rolling-100 (recent stability; the meaningful one once a
+                    # run has stabilised, since the cumulative one is dragged up
+                    # forever by early-training chaos).
                     logger._reward_history.append(score)
                     reward_variance = float(np.var(logger._reward_history))
+                    reward_variance_100 = float(np.var(logger._reward_history[-100:]))
                     logger.scalar(f"reward_variance", reward_variance)
+                    logger.scalar(f"reward_variance_100", reward_variance_100)
 
                     # I-store para ma-access sa write()
                     logger._last_train_return = score
                     logger._last_reward_variance = reward_variance
+                    logger._last_reward_variance_100 = reward_variance_100
                     
                     logger.write(step=logger.step)
 
@@ -304,10 +335,14 @@ def simulate(
                     if not "eval_lengths" in locals():
                         eval_lengths = []
                         eval_scores = []
+                        eval_outcomes = []
                         eval_done = False
                     # start counting scores for evaluation
                     eval_scores.append(score)
                     eval_lengths.append(length)
+                    # Terminal outcome label from the env (success/collision/timeout);
+                    # None for envs that do not report one.
+                    eval_outcomes.append(infos[i].get('outcome'))
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
@@ -319,17 +354,27 @@ def simulate(
                         logger.scalar(f"eval_length", length)
                         logger.scalar(f"eval_episodes", len(eval_scores))
                         
-                        # Thesis — eval success rate
-                        eval_success = sum(1 for s in eval_scores if s == 100)
-                        eval_collision = sum(1 for s in eval_scores if s == -10)
-                        logger.scalar(f"eval_success_rate", 
-                                    round(eval_success / len(eval_scores) * 100, 2))
-                        logger.scalar(f"eval_collision_rate",
-                                    round(eval_collision / len(eval_scores) * 100, 2))
-                        
+                        # Thesis — eval success / collision rate.
+                        # Scored from the terminal outcome LABEL (not the reward
+                        # value), so it is correct under shaped reward and keeps
+                        # timeouts out of the collision count. Falls back to the
+                        # reward value only for envs that report no outcome.
+                        eval_success = sum(
+                            1 for o, s in zip(eval_outcomes, eval_scores)
+                            if o == 'success' or (o is None and s == 100)
+                        )
+                        eval_collision = sum(
+                            1 for o, s in zip(eval_outcomes, eval_scores)
+                            if o == 'collision' or (o is None and s == -10)
+                        )
+                        eval_success_rate = round(eval_success / len(eval_scores) * 100, 2)
+                        eval_collision_rate = round(eval_collision / len(eval_scores) * 100, 2)
+                        logger.scalar(f"eval_success_rate", eval_success_rate)
+                        logger.scalar(f"eval_collision_rate", eval_collision_rate)
+
                         logger._last_eval_return = score
-                        logger._last_eval_success_rate = round(eval_success / len(eval_scores) * 100, 2)
-                        logger._last_eval_collision_rate = round(eval_collision / len(eval_scores) * 100, 2)
+                        logger._last_eval_success_rate = eval_success_rate
+                        logger._last_eval_collision_rate = eval_collision_rate
                         
                         logger.write(step=logger.step)
                         eval_done = True

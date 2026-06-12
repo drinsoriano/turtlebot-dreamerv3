@@ -46,7 +46,7 @@ _try_init_nvml()
 
 class ResourceLogger:
     def __init__(self, run_name: str, stage: int, odometry_mode: str,
-                 device: str, lidar: int):
+                 device: str, lidar: int, csv_dir: str = './csv_logs'):
         self._run_name      = run_name
         self._stage         = stage
         self._odometry_mode = odometry_mode
@@ -70,11 +70,11 @@ class ResourceLogger:
             except Exception:
                 pass
 
-        os.makedirs('./csv_logs', exist_ok=True)
-        path = f'./csv_logs/resource_{run_name}.csv'
+        os.makedirs(csv_dir, exist_ok=True)
+        path = f'{csv_dir}/resource_{run_name}.csv'
         is_new = not os.path.exists(path)
         if not is_new:
-            print(f'[resource_logger] Appending to existing CSV: csv_logs/resource_{run_name}.csv'
+            print(f'[resource_logger] Appending to existing CSV: {path}'
                   f'  session_id={self._session_id}'
                   f'  (previous sessions remain; filter by session_id to isolate runs)')
         self._file = open(path, 'a', newline='')

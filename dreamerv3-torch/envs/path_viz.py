@@ -8,7 +8,7 @@ Generates a 2-D overhead plot per episode showing:
   - Actual robot trajectory (orange)
   - Start (green circle) and goal (red star)
 
-Saved to: ./path_plots/{run_name}/ep{episode:05d}_{outcome}.png
+Saved to: {plots_dir}/{run_name}/ep{episode:05d}_{outcome}.png
 
 Called from turtle.py at episode end inside a try/except — never crashes training.
 Do not import this module from training-critical code paths outside that guard.
@@ -85,9 +85,10 @@ def save_episode_plot(
     efficiency: float | str = '',
     astar_center_waypoints: list[tuple[float, float]] | None = None,
     efficiency_center: float | str = '',
+    plots_dir: str = './path_plots',
 ) -> None:
-    """Save top-down path comparison plot to path_plots/{run_name}/."""
-    out_dir = os.path.join('./path_plots', run_name)
+    """Save top-down path comparison plot to {plots_dir}/{run_name}/."""
+    out_dir = os.path.join(plots_dir, run_name)
     os.makedirs(out_dir, exist_ok=True)
     fname = os.path.join(out_dir, f'ep{episode:05d}_{outcome}.png')
 

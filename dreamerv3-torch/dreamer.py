@@ -167,6 +167,8 @@ def make_env(config, mode, id):
         reward_turn_penalty=config.reward_turn_penalty,
         reward_near_obstacle_scale=config.reward_near_obstacle_scale,
         reward_near_obstacle_sigma=config.reward_near_obstacle_sigma,
+        csv_dir=config.csv_dir,
+        plots_dir=config.plots_dir,
     )
     env = wrappers.UUID(env)
     return env
@@ -190,7 +192,7 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step, log_videos=config.log_videos)
+    logger = tools.Logger(logdir, config.action_repeat * step, log_videos=config.log_videos, csv_dir=config.csv_dir)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -274,7 +276,7 @@ def main(config):
     while agent._step < config.steps + config.eval_every:
         ctr += 1
         logger.write()
-        if config.eval_episode_num > 0 and ctr % 4 == 0: # skips the first eval and evals every 8 trains
+        if config.eval_episode_num > 0:  # evaluate every eval_every steps (one training round per iteration)
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
             eval_ret = tools.simulate(

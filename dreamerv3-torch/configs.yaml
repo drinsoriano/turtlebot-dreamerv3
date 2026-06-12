@@ -9,7 +9,7 @@ defaults:
   deterministic_run: False
   steps: 300000
   parallel: False
-  eval_every: 0.5e4
+  eval_every: 2e4
   eval_episode_num: 100
   log_every: 1e4
   reset_every: 0
@@ -21,8 +21,10 @@ defaults:
   stage: 1
   lidar: 360
   odometry_mode: 'none'
-  resource_logging: false
+  resource_logging: true
   log_videos: true
+  csv_dir: './csv_logs'             # base dir for all per-run CSVs (BO trials use a subfolder)
+  plots_dir: './path_plots'         # base dir for path-plot PNGs (BO trials use a subfolder)
 
   # Reward shaping (opt-in; default mode = original sparse reward, unchanged)
   reward_mode: 'default'            # 'default' | 'shaped'
@@ -117,5 +119,5 @@ turtle:
   precision: 32
   lidar: 360
   odometry_mode: 'none'
-  resource_logging: false
+  resource_logging: true
   log_videos: false
