@@ -45,7 +45,7 @@ Replace `turtle_stage1.py` with `turtle_stage2.py` etc. for other stages. The Ga
 Verify the simulation is ready before starting training:
 ```bash
 ros2 service list | grep reset       # expect /reset_simulation
-ros2 topic list | grep -E "/odom|/scan|/cmd_vel"  # expect all three
+ros2 topic list | grep -E "/odom|/scan|/cmd_vel|/imu"  # expect all four (/imu only needed for odometry_mode=full_imu)
 ```
 
 **Step 2 — train DreamerV3:**
