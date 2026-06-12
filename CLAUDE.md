@@ -392,6 +392,34 @@ python3 dreamer.py \
   --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
 ```
 
+**IMU ablation — `full_imu` mode (branch `imu-observation`):**
+
+Adds 2D linear acceleration from `/imu` on top of `full` odometry (7-dim `odometry` key). `/imu` is already published by the burger SDF on every stage — no Gazebo/SDF change needed. Use a **fresh logdir** (`.npz`/checkpoints are not compatible across odometry modes).
+
+Smoke test:
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+python3 dreamer.py \
+  --configs turtle --task turtle \
+  --logdir ./logdir/gpu_smoke_stage{n}_full_imu_seed0 \
+  --stage {n} --lidar 360 --odometry_mode full_imu --seed 0 \
+  --device cuda --steps 5000 --eval_episode_num 2
+```
+
+Full training:
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+python3 dreamer.py \
+  --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_full_imu_seed0 \
+  --stage {n} --lidar 360 --odometry_mode full_imu --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100
+```
+
+Verify `/imu` is live first (Gazebo running): `ros2 topic echo /imu --once` should show a populated `linear_acceleration`. The `full_imu` run logs `imu_enabled=True` and `sensor_config_id=lidar360_full_imu` in `resource_{run_name}.csv`, and `odometry_mode=full_imu` in `blackbox_{run_name}.csv`.
+
 Resource logging is **on by default** (`resource_logging: true` in `configs.yaml`) — no flag needed. To disable: add `--resource_logging False`.
 
 Custom CSV output directory (e.g. to keep BO validation runs separate from tune trials):
@@ -399,7 +427,7 @@ Custom CSV output directory (e.g. to keep BO validation runs separate from tune 
   --csv_dir ./csv_logs/my_experiment
 ```
 
-Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, or `full` as needed.
+Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, `full`, or `full_imu` as needed.
 
 ## Git Rules
 
