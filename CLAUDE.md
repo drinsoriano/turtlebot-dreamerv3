@@ -75,6 +75,20 @@ Ablation logdir naming convention: `./logdir/stage{N}_{lidar}_{mode}_seed{S}`
 
 Each mode must use a **fresh logdir** — episode archives (`.npz`) and checkpoints are not compatible across modes.
 
+### Auto-organized run folders
+
+To stop runs from scattering flat in `csv_logs/`, **every** `dreamer.py` run auto-organizes its CSVs and path-plots into a **per-mode-per-stage subfolder**, applied in `dreamer.py main()`:
+
+```
+csv_logs/{odometry_mode}_stage{N}/      path_plots/{odometry_mode}_stage{N}/
+```
+
+Examples: `csv_logs/none_stage1/`, `csv_logs/full_stage1/`, `csv_logs/full_imu_stage3/`. This covers **all nine CSVs (whitebox included)** plus path-plots, mirrors how BO trials use `csv_logs/tune_stage{N}/`, and groups all seeds of the same mode+stage together. Filenames inside stay `{type}_{run_name}.csv` (run/seed distinguished by `run_name`).
+
+- **The `--odometry_mode` flag — not the `--logdir` name — sets the mode** (and thus the folder). A logdir called `..._full_seed0` run with `--odometry_mode none` is a **none** run and lands in `none_stage{N}/`.
+- **Override:** pass an explicit `--csv_dir` / `--plots_dir` to opt out (e.g. BO sets its own `--csv_dir ./csv_logs/tune_stage{N}`; the auto-folder is skipped whenever these differ from the `./csv_logs` / `./path_plots` defaults).
+- **Dashboard:** the sidebar folder picker auto-discovers every `{mode}_stage{N}/` (and `tune_stage{N}/`) subfolder. The `"."` (flat `csv_logs/`) view now holds only **legacy** runs from before auto-foldering.
+
 **`full_imu` IMU source (no Gazebo change needed):** The burger SDF already runs the IMU plugin (`libgazebo_ros_imu_sensor.so`) publishing `sensor_msgs/Imu` to `/imu` at 200 Hz — confirmed in **both** the local SDF and the system install at `/opt/ros/humble/share/turtlebot3_gazebo/models/turtlebot3_burger/model.sdf` (the system SDF is the one that loads; see Gazebo Launch Notes). The REP 145 IMU warning is that same plugin at runtime. So `/imu` is available on **all stages 1–8** with no SDF/launch edit. Only `linear_acceleration.x/y` are used; gyro (`angular_velocity.*`) and `accel_z` are intentionally excluded (near-zero information on a flat 2D arena). The `/imu` subscription is created **only** when `odometry_mode == 'full_imu'`, so `none/twist/delta/full` stay zero-overhead and behaviorally unchanged. The resource CSV records `imu_enabled=True` and `sensor_config_id=lidar{N}_full_imu`.
 
 ### Baseline Clarification
@@ -396,7 +410,7 @@ python3 dreamer.py \
 
 Adds 2D linear acceleration from `/imu` on top of `full` odometry (7-dim `odometry` key). `/imu` is already published by the burger SDF on every stage — no Gazebo/SDF change needed. Use a **fresh logdir** (`.npz`/checkpoints are not compatible across odometry modes).
 
-**CSVs/plots auto-organize into a per-stage subfolder.** `full_imu` runs write to `csv_logs/imu_stage{N}/` and `path_plots/imu_stage{N}/` automatically (mirrors how BO trials use `csv_logs/tune_stage{N}/`) — **no flags needed**. This is applied in `dreamer.py main()` and covers all nine CSVs (whitebox included) plus path-plots. It is skipped if you override `--csv_dir` / `--plots_dir`. The dashboard's sidebar folder picker lists `imu_stage{N}` automatically, just like `tune_stage{N}`.
+**CSVs/plots auto-organize into a per-mode-per-stage subfolder** (see [Auto-organized run folders](#auto-organized-run-folders)). `full_imu` runs land in `csv_logs/full_imu_stage{N}/` and `path_plots/full_imu_stage{N}/` automatically — **no flags needed**.
 
 Smoke test:
 ```bash
@@ -420,7 +434,7 @@ python3 dreamer.py \
   --device cuda --steps 300000 --eval_episode_num 100
 ```
 
-Verify `/imu` is live first (Gazebo running): `ros2 topic echo /imu --once` should show a populated `linear_acceleration`. The `full_imu` run logs `imu_enabled=True` and `sensor_config_id=lidar360_full_imu` in `resource_{run_name}.csv`, and `odometry_mode=full_imu` in `blackbox_{run_name}.csv` — all under the auto-created `csv_logs/imu_stage{N}/` subfolder.
+Verify `/imu` is live first (Gazebo running): `ros2 topic echo /imu --once` should show a populated `linear_acceleration`. The `full_imu` run logs `imu_enabled=True` and `sensor_config_id=lidar360_full_imu` in `resource_{run_name}.csv`, and `odometry_mode=full_imu` in `blackbox_{run_name}.csv` — all under the auto-created `csv_logs/full_imu_stage{N}/` subfolder.
 
 Resource logging is **on by default** (`resource_logging: true` in `configs.yaml`) — no flag needed. To disable: add `--resource_logging False`.
 
@@ -537,7 +551,7 @@ Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.cs
 
 `run_name` is derived from the final component of `--logdir` in `make_env()`.
 
-**CSV base directory:** all per-run CSVs are written under `config.csv_dir` (default `./csv_logs`, a config/CLI knob threaded through `make_env` → `Turtle` → `Env.init_properties` and `ResourceLogger`, **and into `tools.Logger` via `dreamer.py` for the whitebox CSV**). Only the base directory is configurable — the `{type}_{run_name}.csv` filenames, train/eval routing, and resume logic are unchanged. `tune_reward.py` sets `--csv_dir ./csv_logs/tune_stage{N}` so BO-trial CSVs stay in a per-stage subfolder; the dashboard's sidebar folder picker reads either `csv_logs/` or a subfolder.
+**CSV base directory:** all per-run CSVs are written under `config.csv_dir`, a config/CLI knob threaded through `make_env` → `Turtle` → `Env.init_properties` and `ResourceLogger`, **and into `tools.Logger` via `dreamer.py` for the whitebox CSV**. The config default is `./csv_logs`, but `dreamer.py main()` auto-redirects it to a per-mode-per-stage subfolder `./csv_logs/{odometry_mode}_stage{N}/` (and `plots_dir` likewise) unless the user passes an explicit `--csv_dir` / `--plots_dir` — see [Auto-organized run folders](#auto-organized-run-folders). Only the base directory is auto-set — the `{type}_{run_name}.csv` filenames, train/eval routing, and resume logic are unchanged. `tune_reward.py` sets `--csv_dir ./csv_logs/tune_stage{N}` (an explicit override, so the auto-folder is skipped) to keep BO-trial CSVs in their own per-stage subfolder; the dashboard's sidebar folder picker reads `csv_logs/` or any subfolder.
 
 > **Whitebox now honours `csv_dir` (fixed 2026-06-09).** Previously `tools.Logger` hardcoded the whitebox path to `./csv_logs/whitebox_{run}.csv`, so it split from the other CSVs on `--csv_dir`-redirected (tuner) runs. It now writes `{csv_dir}/whitebox_{run}.csv`, co-located with blackbox/planning/reward/resource. **Files written before the fix stay where they were** — Python loads `tools.py` once per process, so a run already in flight keeps the old path until it restarts; only new/next subprocesses pick up the change.
 

@@ -186,16 +186,18 @@ def main(config):
     config.log_every //= config.action_repeat
     config.time_limit //= config.action_repeat
 
-    # full_imu auto-organizes all CSVs/plots into a per-stage subfolder
-    # (mirrors BO's csv_logs/tune_stage{N}/) so IMU-ablation runs don't mix
-    # with baseline runs in the flat csv_logs/. Mutating config here covers
-    # both the whitebox Logger (below) and make_env (blackbox/planning/reward/
-    # resource/plots). Skipped if the user overrode --csv_dir / --plots_dir.
-    if config.odometry_mode == 'full_imu':
-        if config.csv_dir == './csv_logs':
-            config.csv_dir = f'./csv_logs/imu_stage{config.stage}'
-        if config.plots_dir == './path_plots':
-            config.plots_dir = f'./path_plots/imu_stage{config.stage}'
+    # Auto-organize every run into a per-mode-per-stage subfolder
+    # ({odometry_mode}_stage{N}, e.g. none_stage1/, full_stage1/,
+    # full_imu_stage1/) — mirrors BO's csv_logs/tune_stage{N}/ so runs never
+    # scatter flat in csv_logs/. Mutating config here covers both the whitebox
+    # Logger (below) and make_env (blackbox/planning/reward/resource/plots).
+    # Skipped if the user overrode --csv_dir / --plots_dir (e.g. BO trials,
+    # which set their own --csv_dir).
+    _run_subdir = f'{config.odometry_mode}_stage{config.stage}'
+    if config.csv_dir == './csv_logs':
+        config.csv_dir = f'./csv_logs/{_run_subdir}'
+    if config.plots_dir == './path_plots':
+        config.plots_dir = f'./path_plots/{_run_subdir}'
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)

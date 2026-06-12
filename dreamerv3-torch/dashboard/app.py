@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 CSV_BASE   = Path(__file__).parent.parent / "csv_logs"
-CSV_DIR    = CSV_BASE   # active CSV dir; sidebar may switch to a subfolder (e.g. tune_stage1, imu_stage1)
+CSV_DIR    = CSV_BASE   # active CSV dir; sidebar may switch to a subfolder (e.g. none_stage1, full_stage1, full_imu_stage1, tune_stage1)
 PLOTS_BASE = Path(__file__).parent.parent / "path_plots"
 PLOTS_DIR  = PLOTS_BASE  # mirrors CSV_DIR: same subfolder name under path_plots/
 
@@ -44,9 +44,11 @@ OUTCOME_TEXT_COLORS = {
 def list_csv_folders() -> list[str]:
     """`"."` (the csv_logs base) plus any immediate subfolders holding run CSVs.
 
-    BO trials write to csv_logs/tune_stage{N}/ and full_imu runs to
-    csv_logs/imu_stage{N}/, so this surfaces those (and any other run-CSV
-    subfolder) as selectable folders without mixing them into the main run list.
+    Every run auto-organizes into csv_logs/{odometry_mode}_stage{N}/ (e.g.
+    none_stage1/, full_stage1/, full_imu_stage1/), and BO trials into
+    csv_logs/tune_stage{N}/, so this surfaces those (and any other run-CSV
+    subfolder) as selectable folders. `"."` itself holds only legacy flat CSVs
+    from before per-run foldering.
     """
     folders = ["."]
     if CSV_BASE.exists():
