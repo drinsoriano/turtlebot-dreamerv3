@@ -8,13 +8,14 @@ TurtleBot3 autonomous navigation using DreamerV3 (model-based RL). The robot rec
 
 **Stage coverage: 1–8 (fully supported).** The goal sampler `_sample_target_position` in `envs/turtle.py` defines start/goal layouts for stages 1–8 (stages 7 and 8 added 2026-06-09; unknown stage → `ValueError`), and the A* arena geometry (`STAGE_ARENAS` in `envs/stage_map.py`) covers 1–8. Each stage needs its own Gazebo launch file (`turtle_stage{N}.py`) and a matching `--stage N`. A thesis-ready methodology and supporting docs live under `docs/` (`methodology.md`, `implementation_audit.md`, `whitebox_data_validation.md`, etc.).
 
-Active development spans three branches: `reward-shaping` (current — reward-shaping experiments), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
+Active development spans four branches: `reward-shaping-optuna` (BO tuning checkpoint), `depth-perception` (current — depth camera integration), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
 
 ## Project Branches
 
 | Branch | Purpose |
 |--------|---------|
-| `reward-shaping` | **Current active branch** — reward-shaping experiments for path efficiency across all stages |
+| `depth-perception` | **Current active branch** — depth camera integration: burger SDF, ROS2 `/camera/depth/image_raw`, obs wiring, CNN encoder |
+| `reward-shaping-optuna` | BO tuning checkpoint — Optuna reward-weight search; branched off before depth work |
 | `planner-efficiency-metric` | Upstream baseline — A* metric, path plots, dashboard, resource-cost logging |
 | `odometry-observation` | Odometry ablation — none / twist / delta / full modes |
 | `baseline-csv-working` | Frozen checkpoint — preserved and pushed |
@@ -563,7 +564,15 @@ Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 ## Future Work
 
 ### Future perception modes
-- `lidar` — current mode
-- `depth` — depth camera (future)
-- `lidar_depth` — combined (future)
-- Depth camera and CNN integration are future work, separate from the current odometry ablation. Do not implement until explicitly scoped.
+- `lidar` — current mode (all existing branches)
+- `depth` — depth camera on branch `depth-perception` (active)
+- `lidar_depth` — combined LiDAR + depth (future, after `depth-perception` is validated)
+
+**Depth camera integration scope (branch `depth-perception`):**
+- Add depth camera to burger SDF in `turtlebot3_gazebo/` (Gazebo plugin, no root access needed for local SDF)
+- Subscribe to ROS2 `/camera/depth/image_raw` in `envs/turtle.py`
+- Wire depth image into `observation_space` as a new `depth` key
+- Activate CNN encoder in `configs.yaml`: `cnn_keys: 'depth'` (MLP keys remain `sensor_readings`, `target`, `velocity`, etc.)
+- Reward shaping weights do not need re-tuning — RS-1 through RS-4 are computed from env state (LiDAR + pose), not from policy inputs
+
+Do not implement `lidar_depth` combination until `depth-only` ablation is validated.
