@@ -529,13 +529,13 @@ Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 
 | Column | Scope | Notes |
 |---|---|---|
-| `cpu_percent_process` | Process only | `psutil.Process.cpu_percent()` |
+| `cpu_percent_process` | Process only | `psutil.Process.cpu_percent()`; **can exceed 100%** — sum across all cores (PyTorch uses multiple threads; 150–400% is normal during GPU training) |
 | `ram_used_mb_process` | Process only | `psutil.Process.memory_info().rss` |
-| `gpu_memory_used_mb_process` | Process only | NVML `nvmlDeviceGetComputeRunningProcesses()` filtered by PID |
-| `cpu_percent_system` | System-wide (context) | includes all desktop apps |
-| `ram_percent_system` | System-wide (context) | includes all desktop apps |
-| `gpu_util_percent_device` | Device-wide (context) | NVML has no per-process GPU util |
-| `gpu_memory_used_mb_device` | Device-wide (context) | total device used |
+| `gpu_memory_used_mb_process` | Process only | NVML `nvmlDeviceGetComputeRunningProcesses()` filtered by PID; **correct metric for thesis** — Gazebo uses OpenGL (not CUDA) so it does NOT appear here |
+| `cpu_percent_system` | System-wide (context) | includes all desktop apps and Gazebo |
+| `ram_percent_system` | System-wide (context) | includes all desktop apps and Gazebo |
+| `gpu_util_percent_device` | Device-wide (context) | NVML has no per-process GPU util; includes desktop rendering load (Xorg, Chrome, VSCode) |
+| `gpu_memory_used_mb_device` | Device-wide (context) | total device used — **typically ~600–1100 MB higher than `gpu_memory_used_mb_process`** due to Xorg (~370 MB), gnome-shell (~70 MB), VSCode (~88 MB), Chrome (~55 MB), gzserver/gzclient (~29 MB); do NOT use for thesis reporting |
 | `gpu_power_watts` | Device-wide (context) | NVML |
 | `gpu_temperature_c` | Device-wide (context) | NVML |
 
@@ -553,6 +553,10 @@ Implementation: `dreamerv3-torch/envs/resource_logger.py`.
 - `device` = training compute device (`cpu` or `cuda`) — not a sensor column.
 - `gpu_util_percent_device` is an **instantaneous sample** at episode end. It may read 0% if the training step is not executing at that exact moment. Use it for trend analysis across many episodes, not single-episode interpretation.
 - `gpu_memory_used_mb_process` and `gpu_power_watts` are more reliable per-episode indicators: process memory persists between steps and power reflects actual compute load over the episode duration.
+- **`gpu_memory_used_mb_device` is significantly inflated on a desktop machine.** On this setup it runs ~600–1100 MB above `gpu_memory_used_mb_process` because NVML device memory includes all GPU processes (compute + OpenGL): Xorg (~370 MB), gnome-shell (~70 MB), VSCode (~88 MB), Chrome (~55 MB), gzserver/gzclient (~29 MB). **Use `gpu_memory_used_mb_process` for thesis reporting.** `gpu_memory_used_mb_device` is context only.
+- **`cpu_percent_process` can exceed 100%** — `psutil` reports the sum across all CPU cores. PyTorch uses multiple threads (training, DataLoader, etc.); values of 150–400% are normal during active GPU training. To get per-core utilization, divide by `os.cpu_count()`.
+- **Why CPU stays high despite CUDA training:** GPU handles only the model forward/backward pass. Everything else runs on CPU: ROS2 `spin_once` + LiDAR/odometry callbacks, reward computation, episode file I/O (`.npz` save/load), and PyTorch kernel dispatch overhead. For a small MLP-based model on LiDAR, the GPU finishes each batch in milliseconds — the actual bottleneck is Gazebo simulation speed (RTF ~4.5×) and ROS2 step latency, not the GPU. High `cpu_percent_process` with CUDA is expected and by design.
+- **Gazebo resource cost is NOT captured** — `gzserver` and `gzclient` run as separate processes. Their CPU (typically 15–30% of system) and RAM are not in `cpu_percent_process` or `ram_used_mb_process`. For total experiment cost, the DreamerV3 process metrics must be combined with a separate measurement of the Gazebo processes.
 
 **Dependencies:** `psutil` (already installed), `pynvml` / `nvidia-ml-py3` (installed). If either is missing, the affected fields are blank — training never crashes.
 

@@ -638,14 +638,21 @@ def _section_resource(run_name: str, res_df: pd.DataFrame, res_eval_df: pd.DataF
     # ── Trend charts ──────────────────────────────────────────────────────────
     st.subheader("Resource Trends")
     st.caption(
-        "**Process metrics** = DreamerV3 Python process only.  "
-        "**Device metrics** = GPU device context (may include other GPU users)."
+        "**Process metrics** = DreamerV3 Python process only (use these for thesis reporting).  \n"
+        "**Device metrics** = GPU device context — includes ALL GPU users "
+        "(Xorg ≈370 MB, gnome-shell ≈70 MB, VSCode ≈88 MB, Chrome ≈55 MB, "
+        "gzserver/gzclient ≈29 MB).  \n"
+        "**`cpu_percent_process` can exceed 100%** — psutil sums across all CPU cores; "
+        "PyTorch uses multiple threads so 150–400% is normal during GPU training.  \n"
+        "**High CPU with CUDA is expected** — GPU handles only the model forward/backward pass; "
+        "ROS2 callbacks, episode I/O, and kernel dispatch still run on CPU."
     )
     chart_specs = [
         ("episode_wall_time_sec",       "Episode Wall Time (s)  [process]"),
+        ("cpu_percent_process",         "CPU %  [process — sum over all cores; >100% = multi-core]"),
         ("ram_used_mb_process",         "RAM Used MB  [process]"),
-        ("gpu_memory_used_mb_process",  "GPU Memory MB  [process — primary]"),
-        ("gpu_memory_used_mb_device",   "GPU Memory MB  [device context]"),
+        ("gpu_memory_used_mb_process",  "GPU Memory MB  [process — primary, thesis metric]"),
+        ("gpu_memory_used_mb_device",   "GPU Memory MB  [device — inflated by desktop ~600–1100 MB]"),
         ("gpu_power_watts",             "GPU Power (W)  [device context]"),
         ("gpu_temperature_c",           "GPU Temperature (°C)  [device context]"),
     ]

@@ -1,3 +1,5 @@
 logdir/
 csv_logs/
 path_plots/
+*.db
+*.db-journal
