@@ -8,13 +8,15 @@ TurtleBot3 autonomous navigation using DreamerV3 (model-based RL). The robot rec
 
 **Stage coverage: 1–8 (fully supported).** The goal sampler `_sample_target_position` in `envs/turtle.py` defines start/goal layouts for stages 1–8 (stages 7 and 8 added 2026-06-09; unknown stage → `ValueError`), and the A* arena geometry (`STAGE_ARENAS` in `envs/stage_map.py`) covers 1–8. Each stage needs its own Gazebo launch file (`turtle_stage{N}.py`) and a matching `--stage N`. A thesis-ready methodology and supporting docs live under `docs/` (`methodology.md`, `implementation_audit.md`, `whitebox_data_validation.md`, etc.).
 
-Active development spans three branches: `reward-shaping` (current — reward-shaping experiments), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
+Active development spans several branches: `imu-observation` (current — IMU `full_imu` mode), `reward-shaping-optuna` (BO tuning checkpoint), `depth-perception` (depth camera integration), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
 
 ## Project Branches
 
 | Branch | Purpose |
 |--------|---------|
-| `reward-shaping` | **Current active branch** — reward-shaping experiments for path efficiency across all stages |
+| `imu-observation` | **Current active branch** — IMU integration via the `full_imu` odometry mode (`full` + 2D linear acceleration from `/imu`); branched off `reward-shaping-optuna` |
+| `reward-shaping-optuna` | BO tuning checkpoint — Optuna reward-weight search; clean checkpoint that IMU and depth branch off |
+| `depth-perception` | Depth camera integration — burger SDF, ROS2 `/camera/depth/image_raw`, obs wiring, CNN encoder |
 | `planner-efficiency-metric` | Upstream baseline — A* metric, path plots, dashboard, resource-cost logging |
 | `odometry-observation` | Odometry ablation — none / twist / delta / full modes |
 | `baseline-csv-working` | Frozen checkpoint — preserved and pushed |
@@ -67,10 +69,13 @@ See **Example Commands** for smoke test and full training variants.
 | `twist` | (2,) | `[odom_linear_x, odom_angular_z]` from `/odom` twist |
 | `delta` | (3,) | `[Δx_local, Δy_local, Δyaw]` in robot frame |
 | `full` | (5,) | Both twist and delta combined |
+| `full_imu` | (7,) | `full` (5) **+** `[accel_x, accel_y]` — 2D robot-frame linear acceleration from `/imu` (branch `imu-observation`) |
 
 Ablation logdir naming convention: `./logdir/stage{N}_{lidar}_{mode}_seed{S}`
 
 Each mode must use a **fresh logdir** — episode archives (`.npz`) and checkpoints are not compatible across modes.
+
+**`full_imu` IMU source (no Gazebo change needed):** The burger SDF already runs the IMU plugin (`libgazebo_ros_imu_sensor.so`) publishing `sensor_msgs/Imu` to `/imu` at 200 Hz — confirmed in **both** the local SDF and the system install at `/opt/ros/humble/share/turtlebot3_gazebo/models/turtlebot3_burger/model.sdf` (the system SDF is the one that loads; see Gazebo Launch Notes). The REP 145 IMU warning is that same plugin at runtime. So `/imu` is available on **all stages 1–8** with no SDF/launch edit. Only `linear_acceleration.x/y` are used; gyro (`angular_velocity.*`) and `accel_z` are intentionally excluded (near-zero information on a flat 2D arena). The `/imu` subscription is created **only** when `odometry_mode == 'full_imu'`, so `none/twist/delta/full` stay zero-overhead and behaviorally unchanged. The resource CSV records `imu_enabled=True` and `sensor_config_id=lidar{N}_full_imu`.
 
 ### Baseline Clarification
 

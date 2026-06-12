@@ -8,7 +8,7 @@ from time import sleep
 from rclpy.node import Node
 from std_srvs.srv import Empty
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Imu
 from nav_msgs.msg import Odometry
 from gazebo_msgs.srv import SpawnEntity, DeleteEntity, GetEntityState, SetEntityState
 import time
@@ -64,6 +64,10 @@ class Env(Node):
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
         self.odom_subscription = self.create_subscription(Odometry, '/odom', self.odom_callback, 1)
         self.scan_subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, 1)
+        # IMU subscription only for full_imu mode — keeps other modes zero-overhead (no 200 Hz callback)
+        self.imu_data = None
+        if odometry_mode == 'full_imu':
+            self.imu_subscription = self.create_subscription(Imu, '/imu', self.imu_callback, 1)
         self.spawn_entity_client = self.create_client(SpawnEntity, '/spawn_entity')
         self.delete_entity_client = self.create_client(DeleteEntity, '/delete_entity')
         self.reset_client = self.create_client(Empty, '/reset_simulation')
@@ -99,6 +103,7 @@ class Env(Node):
     def reset_info(self):
         self.odom_data = None
         self.scan_data = None
+        self.imu_data = None
 
     def init_properties(self, stage, max_steps, lidar, run_name='baseline', mode='train',
                         odometry_mode='none', device='cpu', resource_logging=False,
@@ -143,6 +148,9 @@ class Env(Node):
         self.prev_odom_y   = 0.0
         self.prev_odom_yaw = 0.0
         self._odom_features = None
+        # IMU (full_imu mode only): 2D robot-frame linear acceleration from /imu
+        self.prev_accel_x = 0.0
+        self.prev_accel_y = 0.0
 
         # CSV Logger — Black-box
         # - success_rate / collision_rate: cumulative over all episodes (overall run performance)
@@ -218,6 +226,7 @@ class Env(Node):
                 device=device,
                 lidar=self.lidar,
                 csv_dir=csv_dir,
+                imu_enabled=(self.odometry_mode == 'full_imu'),
             )
 
         # Reward shaping (opt-in via reward_mode='shaped'; 'default' = original sparse reward)
@@ -253,10 +262,14 @@ class Env(Node):
     def scan_callback(self, msg):
         self.scan_data = msg
 
+    def imu_callback(self, msg):
+        self.imu_data = msg
+
     def get_state(self, linear_vel, angular_vel):
         self.reset_info()
         rclpy.spin_once(self, timeout_sec=0.5)
-        while self.scan_data is None or self.odom_data is None:
+        while (self.scan_data is None or self.odom_data is None
+               or (self.odometry_mode == 'full_imu' and self.imu_data is None)):
             rclpy.spin_once(self, timeout_sec=0.5)
 
         turtle_x = self.odom_data.pose.pose.position.x
@@ -292,8 +305,15 @@ class Env(Node):
                 raw_odom = [odom_linear_x, odom_angular_z]
             elif self.odometry_mode == 'delta':
                 raw_odom = [delta_x_local, delta_y_local, delta_yaw]
-            else:  # full
+            elif self.odometry_mode == 'full':
                 raw_odom = [odom_linear_x, odom_angular_z, delta_x_local, delta_y_local, delta_yaw]
+            else:  # full_imu = full (5) + 2D linear acceleration from /imu
+                accel_x = self.imu_data.linear_acceleration.x
+                accel_y = self.imu_data.linear_acceleration.y
+                self.prev_accel_x = accel_x
+                self.prev_accel_y = accel_y
+                raw_odom = [odom_linear_x, odom_angular_z, delta_x_local, delta_y_local, delta_yaw,
+                            accel_x, accel_y]
             self._odom_features = F.tanh(T.tensor(raw_odom, dtype=T.float32)).tolist()
 
         state = lidar + [distance_to_target, angle_to_target, linear_vel, angular_vel]
@@ -889,7 +909,7 @@ class Turtle(gym.Env):
 
         self.action_space = spaces.Box(low=np.array([0, -1.]), high=np.array([1., 1.]), dtype=np.float32)
 
-        _odom_shapes = {'twist': (2,), 'delta': (3,), 'full': (5,)}
+        _odom_shapes = {'twist': (2,), 'delta': (3,), 'full': (5,), 'full_imu': (7,)}
         if odometry_mode in _odom_shapes:
             odom_shape = _odom_shapes[odometry_mode]
             self.observation_space.spaces['odometry'] = spaces.Box(

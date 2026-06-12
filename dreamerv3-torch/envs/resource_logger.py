@@ -46,7 +46,8 @@ _try_init_nvml()
 
 class ResourceLogger:
     def __init__(self, run_name: str, stage: int, odometry_mode: str,
-                 device: str, lidar: int, csv_dir: str = './csv_logs'):
+                 device: str, lidar: int, csv_dir: str = './csv_logs',
+                 imu_enabled: bool = False):
         self._run_name      = run_name
         self._stage         = stage
         self._odometry_mode = odometry_mode
@@ -54,7 +55,7 @@ class ResourceLogger:
         self._lidar_beams   = lidar
         # perception columns — hardcoded until future modes exist
         self._perception_mode    = 'lidar'
-        self._imu_enabled        = False
+        self._imu_enabled        = imu_enabled   # True under odometry_mode='full_imu'
         self._depth_enabled      = False
         self._depth_camera_count = 0
         self._depth_resolution   = ''
