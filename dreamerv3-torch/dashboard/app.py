@@ -4,6 +4,7 @@ Run: streamlit run dashboard/app.py  (from dreamerv3-torch/)
 """
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -46,9 +47,9 @@ def list_csv_folders() -> list[str]:
 
     Every run auto-organizes into csv_logs/{odometry_mode}_stage{N}/ (e.g.
     none_stage1/, full_stage1/, full_imu_stage1/), and BO trials into
-    csv_logs/tune_stage{N}/, so this surfaces those (and any other run-CSV
-    subfolder) as selectable folders. `"."` itself holds only legacy flat CSVs
-    from before per-run foldering.
+    csv_logs/tune_stage{N}_{mode}/ (e.g. tune_stage1_none/, tune_stage1_full_imu/),
+    so this surfaces those (and any other run-CSV subfolder) as selectable folders.
+    `"."` itself holds only legacy flat CSVs from before per-run foldering.
     """
     folders = ["."]
     if CSV_BASE.exists():
@@ -1049,10 +1050,14 @@ def _section_bo_trials(df: pd.DataFrame):
         st.subheader("Best Config — Validation Command")
         avail = [k for k in _BO_REWARD_KEYS if k in best_row.index and pd.notna(best_row.get(k))]
         weight_flags = " \\\n  ".join(f"--{k} {float(best_row[k]):.6g}" for k in avail)
+        # Derive stage + odometry mode from the selected BO folder (tune_stage{N}_{mode})
+        # so the validation command matches the study that was actually tuned.
+        _m = re.match(r"tune_stage(\d+)_(.+)$", CSV_DIR.name)
+        _stage, _odom = (_m.group(1), _m.group(2)) if _m else ("1", "none")
         st.code(
             f"python3 dreamer.py --configs turtle --task turtle \\\n"
-            f"  --logdir ./logdir/stage1_360_none_seed0_reward_tuned \\\n"
-            f"  --stage 1 --lidar 360 --odometry_mode none --seed 0 \\\n"
+            f"  --logdir ./logdir/stage{_stage}_360_{_odom}_seed0_reward_tuned \\\n"
+            f"  --stage {_stage} --lidar 360 --odometry_mode {_odom} --seed 0 \\\n"
             f"  --device cuda --steps 300000 --eval_episode_num 100 \\\n"
             f"  --reward_mode shaped \\\n"
             f"  {weight_flags}",
@@ -1579,7 +1584,16 @@ def _section_commands():
     )
     st.caption(
         "Verify ready:  `ros2 service list | grep reset`  and  "
-        "`ros2 topic list | grep -E \"/odom|/scan|/cmd_vel\"`"
+        "`ros2 topic list | grep -E \"/odom|/scan|/cmd_vel|/imu\"`  "
+        "(`/imu` only needed for `odometry_mode=full_imu`). "
+        "If a separate terminal sees no topics, `export ROS_LOCALHOST_ONLY=1` to match the launch."
+    )
+    st.info(
+        "**Runs auto-organize by mode+stage (2026-06-12):** every `dreamer.py` run writes "
+        "its CSVs/plots to `csv_logs/{odometry_mode}_stage{N}/` and "
+        "`path_plots/{odometry_mode}_stage{N}/` automatically (e.g. `none_stage1/`, "
+        "`full_imu_stage1/`) — no `--csv_dir` needed. BO trials go to "
+        "`csv_logs/tune_stage{N}_{mode}/`. Pick the folder in the sidebar."
     )
 
     # ── 1. Smoke test ─────────────────────────────────────────────────────────
@@ -1629,6 +1643,21 @@ python3 dreamer.py --configs turtle --task turtle \\
   --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>""",
         language="bash",
     )
+    st.markdown(
+        "**Odometry / IMU ablation** — swap `--odometry_mode` for `twist` / `delta` / "
+        "`full` / `full_imu`. `full_imu` (7-dim: `full` + 2D `/imu` linear acceleration) "
+        "needs no Gazebo change — `/imu` is already published. Use a **fresh logdir** "
+        "(`.npz`/checkpoints are not compatible across modes); CSVs auto-organize into "
+        "`csv_logs/full_imu_stage1/`:"
+    )
+    st.code(
+        """cd ~/turtlebot-dreamerv3/dreamerv3-torch
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage1_360_full_imu_seed0 \\
+  --stage 1 --lidar 360 --odometry_mode full_imu --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100""",
+        language="bash",
+    )
     st.info(
         "**Eval overhead on long runs:** eval fires every `--eval_every` (default "
         "**20000**) steps, so a 300k run ≈ 16 evals and 600k ≈ 31 evals. At "
@@ -1658,13 +1687,18 @@ python3 tune_reward.py --stage 1 --n-trials 2 --dry-run
 python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20
 
 # 2) the search: 30 trials, each an 80k-step run with Optuna-chosen weights
-python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 20""",
+python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 20
+
+# tune under a specific obs space (e.g. IMU) — namespaces the study/db/csv by mode:
+python3 tune_reward.py --stage 1 --odometry-mode full_imu --n-trials 30 --steps 80000 --eval-episode-num 20""",
         language="bash",
     )
     st.caption(
-        "Resumes automatically — re-run the **same** step-2 command after a crash/"
-        "reboot and it continues the study (sqlite `tune_reward_stage1.db`), not "
-        "from trial 0. Sanity-test the full pipeline first with "
+        "`--odometry-mode` (default `none`) sets the obs space the weights are tuned under "
+        "and **always** namespaces the study/db/csv/plots by mode (`tune_stage1_none/`, "
+        "`tune_stage1_full_imu/`, …). Resumes automatically — re-run the **same** command "
+        "after a crash/reboot and it continues the study (sqlite `tune_reward_stage1_{mode}.db`, "
+        "e.g. `_none`), not from trial 0. Sanity-test first with "
         "`--study-name smoke --n-trials 2 --steps 3000 --eval-episode-num 2`."
     )
 
@@ -1676,6 +1710,8 @@ python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 
 
 # write tune_trials_stage1.csv + tune_best_stage1.csv (read-only on the study DB)
 python3 export_tune_results.py --stage 1
+# for a mode-specific study, match the mode (targets tune_stage1_full_imu/):
+python3 export_tune_results.py --stage 1 --odometry-mode full_imu
 
 # then plug the printed --reward_* weights into the 'tuned' full run in section 2,
 # repeat for seeds 0,1,2 on stage 1, then stages 2–4 for the transfer test.""",
@@ -1689,7 +1725,7 @@ python3 export_tune_results.py --stage 1
         ("--stage",                     "(required)",  "1–8; must match the running Gazebo stage"),
         ("--logdir",                    "(required)",  "output dir; run_name = its last component"),
         ("--lidar",                     "360",         "LiDAR beam count"),
-        ("--odometry_mode",             "none",        "none / twist / delta / full"),
+        ("--odometry_mode",             "none",        "none / twist / delta / full / full_imu (full_imu = full + 2D /imu accel)"),
         ("--seed",                      "0",           "RNG seed"),
         ("--device",                    "cpu",         "pass `cuda` to train on GPU"),
         ("--steps",                     "600000",      "total training steps (turtle default; 300k common)"),
@@ -1704,7 +1740,8 @@ python3 export_tune_results.py --stage 1
         ("--prefill",                   "500",         "random steps before training (once)"),
         ("--time_limit",                "250",         "max steps per episode before timeout"),
         ("--resource_logging",          "true",        "CPU/RAM/GPU logging (False to disable)"),
-        ("--csv_dir",                   "./csv_logs",  "base dir for all per-run CSVs"),
+        ("--csv_dir",                   "./csv_logs",  "base for CSVs; auto → ./csv_logs/{mode}_stage{N}/ unless overridden"),
+        ("--plots_dir",                 "./path_plots","base for path-plot PNGs; auto → ./path_plots/{mode}_stage{N}/ unless overridden"),
     ], columns=["flag", "default", "notes"])
     st.dataframe(dreamer_params, width="stretch", hide_index=True, key="cmd_params_dreamer")
 
