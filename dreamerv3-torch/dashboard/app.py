@@ -1579,7 +1579,8 @@ def _section_commands():
     )
     st.code(
         "export TURTLEBOT3_MODEL=burger\n"
-        "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py",
+        "# add gui:=false for HEADLESS (recommended on the eGPU — see note below)\n"
+        "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py gui:=false",
         language="bash",
     )
     st.caption(
@@ -1587,6 +1588,13 @@ def _section_commands():
         "`ros2 topic list | grep -E \"/odom|/scan|/cmd_vel|/imu\"`  "
         "(`/imu` only needed for `odometry_mode=full_imu`). "
         "If a separate terminal sees no topics, `export ROS_LOCALHOST_ONLY=1` to match the launch."
+    )
+    st.warning(
+        "**Headless on the eGPU.** `gzclient` (the GUI) renders via OpenGL on the GPU; on the "
+        "Thunderbolt eGPU that competes with CUDA training and can drop the link mid-run "
+        "(`No CUDA GPUs are available` → every BO trial crashes). Launch with **`gui:=false`** "
+        "for long/BO runs. To drop the GUI of an already-running sim: `pkill -f gzclient` "
+        "(gzserver/training keep going)."
     )
     st.info(
         "**Runs auto-organize by mode+stage (2026-06-12):** every `dreamer.py` run writes "
@@ -1670,10 +1678,14 @@ python3 dreamer.py --configs turtle --task turtle \\
     # ── 3. BO from scratch ────────────────────────────────────────────────────
     st.divider()
     st.subheader("3 · Bayesian Optimization (BO) from scratch")
-    st.markdown("Needs **two terminals**. **Terminal 1 — Gazebo** (stays up the whole study):")
+    st.markdown(
+        "Needs **two terminals**. **Terminal 1 — Gazebo** (stays up the whole study; "
+        "use `gui:=false` — a multi-hour BO on the eGPU is exactly where the GUI's "
+        "OpenGL load drops the link):"
+    )
     st.code(
         "export TURTLEBOT3_MODEL=burger\n"
-        "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py",
+        "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py gui:=false",
         language="bash",
     )
     st.markdown("**Terminal 2 — the tuner** (run the steps in order):")

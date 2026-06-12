@@ -302,6 +302,11 @@ Every `st.plotly_chart` / `st.dataframe` in the per-run sections (`_section_reso
   export TURTLEBOT3_MODEL=burger
   ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage{n}.py
   ```
+- **Headless (`gui:=false`) — strongly recommended for long/BO runs on the eGPU.** Every `turtle_stage{n}.py` declares a `gui` launch argument (default `true`); passing `gui:=false` skips `gzclient.launch.py` so **only `gzserver` (physics) runs, no GUI window**:
+  ```bash
+  ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage{n}.py gui:=false
+  ```
+  **Why this matters:** `gzclient` renders the GUI via **OpenGL on the GPU**. On the Thunderbolt **eGPU**, that rendering competes with CUDA training on the same device and can drop the Thunderbolt link mid-run → `RuntimeError: No CUDA GPUs are available` (every BO trial then crashes with no eval data). Headless removes the OpenGL load and is far more stable (also RTF ≈ 4.99 vs ≈ 4.5–4.7 with GUI). To drop the GUI of an **already-running** sim without restarting (gzserver/training keep going): `pkill -f gzclient`.
 - `turtlebot3_gazebo/` is **not** a built ROS2 package. Do not use `ros2 launch turtlebot3_gazebo ...` (resolves to system install at `/opt/ros/humble`).
 - Launch files resolve local paths via `os.path.dirname(os.path.realpath(__file__))` — **not** `get_package_share_directory('turtlebot3_gazebo')`. Keep `get_package_share_directory('gazebo_ros')` as-is (real system package).
 - `GAZEBO_MODEL_PATH` is prepended to the local `models/` directory via `SetEnvironmentVariable` inside each launch file. Note: `GazeboRosPaths.get_paths()` in `gzserver.launch.py` injects the system turtlebot3_gazebo models first, so system SDF files take priority. Modifying system SDF files requires root.
@@ -348,7 +353,7 @@ Expected: numpy 2.x, matplotlib from `~/.local/`, CUDA True, RTX 5060 Ti.
 
 ## Training Speed
 
-- Gazebo RTF ≈ 4.5–4.7 (with GUI), ≈ 4.99 (headless). Headless gives only marginal gain.
+- Gazebo RTF ≈ 4.5–4.7 (with GUI), ≈ 4.99 (headless). The RTF gain is marginal, **but headless (`gui:=false`) is strongly recommended on the eGPU for stability** — `gzclient`'s OpenGL rendering competes with CUDA on the Thunderbolt link and can drop it mid-run (see Gazebo Launch Notes). Use headless for all long/BO runs.
 - More impactful levers:
   - `--device cuda` — GPU training
   - `--eval_episode_num N` — fewer eval episodes per checkpoint = less wall-clock pause

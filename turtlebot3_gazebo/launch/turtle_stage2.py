@@ -2,7 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
@@ -20,6 +21,11 @@ def generate_launch_description():
     pkg_gazebo_ros  = get_package_share_directory('gazebo_ros')
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'gui', default_value='true',
+            description='launch the Gazebo GUI client; gui:=false for headless '
+                        '(no gzclient OpenGL load — avoids eGPU/Thunderbolt drops)',
+        ),
         SetEnvironmentVariable(
             'GAZEBO_MODEL_PATH',
             os.path.join(_pkg_dir, 'models') + ':' + os.environ.get('GAZEBO_MODEL_PATH', ''),
@@ -34,6 +40,7 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(
                 os.path.join(pkg_gazebo_ros, 'launch', 'gzclient.launch.py')
             ),
+            condition=IfCondition(LaunchConfiguration('gui')),
         ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
