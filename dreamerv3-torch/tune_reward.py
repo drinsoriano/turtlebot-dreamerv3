@@ -10,8 +10,9 @@ finish, and scores the run by parsing the eval CSVs it produced.
 The observation space the weights are tuned under is selectable via ``--odometry-mode``
 (default ``none``). Because the obs space materially changes what the policy can learn,
 reward weights tuned under ``none`` may not be optimal under ``full_imu``; tune under the
-mode you will deploy. A non-``none`` mode namespaces the study/db/CSV/plots folders by
-mode (e.g. ``tune_stage1_full_imu``), so ``none`` and ``full_imu`` studies never collide.
+mode you will deploy. The mode always namespaces the study/db/CSV/plots folders
+(e.g. ``tune_stage1_none``, ``tune_stage1_full_imu``), so studies for the same stage but
+different modes never collide.
 
 Objective (constrained efficiency):
     maximize  eval planner_path_efficiency
@@ -330,9 +331,9 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--odometry-mode", default="none",
                    help="obs space to tune the reward weights under (none/twist/delta/"
-                        "full/full_imu; default none). Non-none namespaces the study/db/"
-                        "CSV/plots by mode (e.g. tune_stage{N}_full_imu) so studies don't "
-                        "collide. Forwarded to dreamer.py as --odometry_mode.")
+                        "full/full_imu; default none). The mode always namespaces the "
+                        "study/db/CSV/plots (e.g. tune_stage{N}_none, tune_stage{N}_full_imu) "
+                        "so studies don't collide. Forwarded to dreamer.py as --odometry_mode.")
     p.add_argument("--steps", type=int, default=80000,
                    help="proxy training budget per trial (>=80000 so SCORE_WINDOW=60 "
                         "lands on the last 3 trained evals, skipping the untrained eval)")
@@ -368,9 +369,9 @@ def main():
     args = p.parse_args()
 
     # Namespace the study/db/CSV/plots by odometry mode so tuning under different
-    # obs spaces (e.g. none vs full_imu) never share a study or folder. Empty suffix
-    # for 'none' keeps existing none-study names/dbs/folders backward-compatible.
-    mode_suffix = "" if args.odometry_mode == "none" else f"_{args.odometry_mode}"
+    # obs spaces (e.g. none vs full_imu) never share a study or folder. The mode
+    # is always part of the name (incl. 'none' -> _none) for consistent naming.
+    mode_suffix = f"_{args.odometry_mode}"
     study_name = args.study_name or f"reward_stage{args.stage}{mode_suffix}"
     storage = args.storage or f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}{mode_suffix}.db'}"
     if args.csv_dir is None:

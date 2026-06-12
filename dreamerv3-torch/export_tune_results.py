@@ -71,18 +71,18 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", type=int, default=1)
     ap.add_argument("--odometry-mode", default="none",
-                    help="match the tune_reward.py run's mode (default none); non-none "
-                         "uses the mode-namespaced study/db/csv (e.g. tune_stage{N}_full_imu)")
+                    help="match the tune_reward.py run's mode (default none); the mode "
+                         "namespaces the study/db/csv (e.g. tune_stage{N}_none, tune_stage{N}_full_imu)")
     ap.add_argument("--study-name", default=None,
-                    help="default: reward_stage{stage}[_{mode}]")
+                    help="default: reward_stage{stage}_{mode}")
     ap.add_argument("--storage", default=None,
-                    help="default: sqlite:///tune_reward_stage{stage}[_{mode}].db in this dir")
+                    help="default: sqlite:///tune_reward_stage{stage}_{mode}.db in this dir")
     ap.add_argument("--csv-dir", default=None,
-                    help="default: ./csv_logs/tune_stage{stage}[_{mode}]")
+                    help="default: ./csv_logs/tune_stage{stage}_{mode}")
     args = ap.parse_args()
 
-    # Mirror tune_reward.py's mode namespacing (empty suffix for none).
-    mode_suffix = "" if args.odometry_mode == "none" else f"_{args.odometry_mode}"
+    # Mirror tune_reward.py's mode namespacing (mode is always in the name, incl. _none).
+    mode_suffix = f"_{args.odometry_mode}"
     study_name = args.study_name or f"reward_stage{args.stage}{mode_suffix}"
     storage = args.storage or \
         f"sqlite:///{THIS_DIR / f'tune_reward_stage{args.stage}{mode_suffix}.db'}"

@@ -87,7 +87,7 @@ Examples: `csv_logs/none_stage1/`, `csv_logs/full_stage1/`, `csv_logs/full_imu_s
 
 - **The `--odometry_mode` flag — not the `--logdir` name — sets the mode** (and thus the folder). A logdir called `..._full_seed0` run with `--odometry_mode none` is a **none** run and lands in `none_stage{N}/`.
 - **Override:** pass an explicit `--csv_dir` / `--plots_dir` to opt out (e.g. BO sets its own `--csv_dir ./csv_logs/tune_stage{N}`; the auto-folder is skipped whenever these differ from the `./csv_logs` / `./path_plots` defaults).
-- **Dashboard:** the sidebar folder picker auto-discovers every `{mode}_stage{N}/` (and `tune_stage{N}/`) subfolder. The `"."` (flat `csv_logs/`) view now holds only **legacy** runs from before auto-foldering.
+- **Dashboard:** the sidebar folder picker auto-discovers every `{mode}_stage{N}/` (and BO `tune_stage{N}_{mode}/`) subfolder. The `"."` (flat `csv_logs/`) view now holds only **legacy** runs from before auto-foldering.
 
 **`full_imu` IMU source (no Gazebo change needed):** The burger SDF already runs the IMU plugin (`libgazebo_ros_imu_sensor.so`) publishing `sensor_msgs/Imu` to `/imu` at 200 Hz — confirmed in **both** the local SDF and the system install at `/opt/ros/humble/share/turtlebot3_gazebo/models/turtlebot3_burger/model.sdf` (the system SDF is the one that loads; see Gazebo Launch Notes). The REP 145 IMU warning is that same plugin at runtime. So `/imu` is available on **all stages 1–8** with no SDF/launch edit. Only `linear_acceleration.x/y` are used; gyro (`angular_velocity.*`) and `accel_z` are intentionally excluded (near-zero information on a flat 2D arena). The `/imu` subscription is created **only** when `odometry_mode == 'full_imu'`, so `none/twist/delta/full` stay zero-overhead and behaviorally unchanged. The resource CSV records `imu_enabled=True` and `sensor_config_id=lidar{N}_full_imu`.
 
@@ -176,18 +176,18 @@ Compare against a no-shaping baseline run on this branch for the same stage (not
 
 `dreamerv3-torch/tune_reward.py` searches the five `shaped`-mode weights with Optuna. It is a **standalone orchestration script** — it launches `dreamer.py` as a subprocess with candidate `--reward_*` flags and scores each run from the eval CSVs. It does **not** modify the reward/observation/odometry/architecture/A\*/dashboard/torch **implementations**. **A\* is used only as the scoring metric, never fed into training.**
 
-**Tuning under a specific odometry mode (`--odometry-mode`, default `none`).** The observation space materially changes what the policy can learn, so reward weights tuned under `none` may not be optimal under `full_imu` — tune under the mode you will deploy. A non-`none` mode **namespaces** the study, db, CSV, and plots folders by mode (suffix `_{mode}`), so `none` and `full_imu` studies for the same stage never collide and can run independently:
+**Tuning under a specific odometry mode (`--odometry-mode`, default `none`).** The observation space materially changes what the policy can learn, so reward weights tuned under `none` may not be optimal under `full_imu` — tune under the mode you will deploy. The mode **always** namespaces the study, db, CSV, and plots folders (suffix `_{mode}`, **including `none` → `_none`** for consistent naming), so studies for the same stage but different modes never collide and can run independently:
 
 | `--odometry-mode` | study / db | trial CSVs | trial logdirs |
 |---|---|---|---|
-| `none` (default) | `reward_stage{N}` / `tune_reward_stage{N}.db` | `csv_logs/tune_stage{N}/` | `logdir/reward_stage{N}/…` |
+| `none` (default) | `reward_stage{N}_none` / `tune_reward_stage{N}_none.db` | `csv_logs/tune_stage{N}_none/` | `logdir/reward_stage{N}_none/…` |
 | `full_imu` | `reward_stage{N}_full_imu` / `tune_reward_stage{N}_full_imu.db` | `csv_logs/tune_stage{N}_full_imu/` | `logdir/reward_stage{N}_full_imu/…` |
 
-The `none` defaults are **unchanged** (backward-compatible — existing `none` studies/dbs resume as before). `export_tune_results.py` takes the same `--odometry-mode` flag so a standalone export targets the matching mode-namespaced study.
+`export_tune_results.py` takes the same `--odometry-mode` flag so a standalone export targets the matching mode-namespaced study. **Note:** pre-existing `none` studies/folders from before this change used the un-suffixed names (`tune_stage{N}`, `tune_reward_stage{N}.db`); migrate them to the `_none` names to resume, or pass `--study-name` / `--csv-dir` / `--storage` explicitly.
 
 - **Objective (constrained efficiency):** maximize eval `planner_path_efficiency` subject to eval `success_rate ≥ baseline_success − margin` (default margin 5 pts). Constraint handled via `TPESampler(constraints_func=...)`.
 - **Fidelity:** short proxy budget per trial (`--steps 80000 --eval_episode_num 20`), then validate the winner at full budget. Trials run **sequentially** (one Gazebo, one GPU). At the default `eval_every = 20000`, an **80k** trial yields **5 evals → ~100 eval episodes**, and `SCORE_WINDOW = 60` scores the **last 3 evals** (the 40k/60k/80k checkpoints), excluding the untrained `ctr=0` eval. **Use `--steps ≥80000` for BO:** a 40k trial has only 3 evals (60 rows), so the 60-row window would reach the untrained `ctr=0` eval and pollute the score (for short trials, lower `SCORE_WINDOW`). `tune_reward.py` does not expose `--eval_every`, so trials use the config default. See [docs/evaluation_loop.md](docs/evaluation_loop.md).
-- **Persistence:** study saved to `tune_reward_stage{N}.db` (sqlite, gitignored) with `load_if_exists=True` — a crash/reboot resumes the study.
+- **Persistence:** study saved to `tune_reward_stage{N}_{mode}.db` (sqlite, gitignored) with `load_if_exists=True` — a crash/reboot resumes the study.
 
 **`tune_reward.py` does not replace `dreamer.py` — it wraps it.** Each trial builds and runs a normal `dreamer.py ... --reward_mode shaped` command with the five `--reward_*` flags chosen by Optuna. A plain `dreamer.py` run (no weight flags) is still the way to do smoke tests, the baseline, and final validation.
 
@@ -223,21 +223,21 @@ python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 
 > or lower `SCORE_WINDOW` for shorter trials.
 It prints the best **feasible** config (efficiency, success, and each `--reward_*` value). If the study crashes or the machine reboots, re-run the **same** step-2 command — it resumes from where it stopped, not from trial 0.
 
-Key flags: `--stage`, `--odometry-mode` (default `none`; non-`none` namespaces the study/db/csv/plots by mode — see above), `--n-trials`, `--steps` (default **80000**), `--eval-episode-num`, `--eval-every` (forwarded to `dreamer.py`; default: omit → config default 20000; **lower it, e.g. 2000, for a fast smoke test**), `--seed`, `--margin` (allowed success drop, pts), `--timeout-per-trial` (sec, default **24 h** so a trial is never cut off unnoticed; a trial exceeding it is stopped and **scored on its partial eval data**, not discarded), `--run-baseline`, `--baseline-success <pct>` (skip the baseline run), `--logdir-root` (base for trial logdirs, default `./logdir` → trials land in `{logdir-root}/{study_name}/{study_name}_trial{NN}`), `--csv-dir` (default `./csv_logs/tune_stage{N}[_{mode}]`), `--study-name` (default `reward_stage{N}[_{mode}]`), `--dry-run`.
+Key flags: `--stage`, `--odometry-mode` (default `none`; non-`none` namespaces the study/db/csv/plots by mode — see above), `--n-trials`, `--steps` (default **80000**), `--eval-episode-num`, `--eval-every` (forwarded to `dreamer.py`; default: omit → config default 20000; **lower it, e.g. 2000, for a fast smoke test**), `--seed`, `--margin` (allowed success drop, pts), `--timeout-per-trial` (sec, default **24 h** so a trial is never cut off unnoticed; a trial exceeding it is stopped and **scored on its partial eval data**, not discarded), `--run-baseline`, `--baseline-success <pct>` (skip the baseline run), `--logdir-root` (base for trial logdirs, default `./logdir` → trials land in `{logdir-root}/{study_name}/{study_name}_trial{NN}`), `--csv-dir` (default `./csv_logs/tune_stage{N}_{mode}`), `--study-name` (default `reward_stage{N}_{mode}`), `--dry-run`.
 
 > **Per-trial budget reality:** a 40k-step trial takes ~140 min on this machine, so an **80k** trial (the recommended BO budget, see above) is ~280 min (~4.7 h); the timeout now defaults to **24 h** so a trial is never cut off unnoticed (no need to raise it for larger `--steps`; lower only for a hard cap). Trial logdirs are namespaced per study (`logdir/{study_name}/{study_name}_trial{NN}`), so re-runs never resume a stale checkpoint. The baseline is idempotent — it is reused if already scored, not re-trained.
 
-> **CSV organization:** each trial emits ~9 CSVs, so trials write to a **per-stage subfolder** `csv_logs/tune_stage{N}/` (via `--csv-dir`, default `./csv_logs/tune_stage{stage}`) instead of flooding the main `csv_logs/`. Main/manual/validation runs keep writing to `csv_logs/`. The Streamlit dashboard has a **CSV-folder picker** in the sidebar to switch between `csv_logs/` (main runs, default) and any `tune_stage{N}/` subfolder.
+> **CSV organization:** each trial emits ~9 CSVs, so trials write to a **per-stage-per-mode subfolder** `csv_logs/tune_stage{N}_{mode}/` (via `--csv-dir`, default `./csv_logs/tune_stage{stage}_{odometry_mode}`, e.g. `tune_stage1_none/`) instead of flooding the main `csv_logs/`. Main/manual/validation runs auto-organize into `csv_logs/{mode}_stage{N}/`. The Streamlit dashboard has a **CSV-folder picker** in the sidebar to switch between `csv_logs/` and any subfolder.
 
 > **Sanity test before a full study:** verify the full pipeline (Gazebo → subprocess → CSV scoring) with a short run before committing to 30 real trials. Pass a small `--eval-every` so each trial actually finishes fast (without it, the default 20000-step round makes even a 3k-step trial train a full round). Use `--study-name smoke` to isolate from the real study and `--logdir-root` so the output folder is obvious:
 > ```bash
 > python3 tune_reward.py --stage 1 --n-trials 2 --steps 4000 --eval-episode-num 2 \
 >   --eval-every 2000 --study-name smoke --logdir-root ./logdir
 > ```
-> Trials land in `./logdir/smoke/smoke_trial000`, `…_trial001` (and `smoke_baseline_seed0` if a baseline runs); CSVs in `./csv_logs/tune_stage{N}/`. Delete the smoke artifacts before starting the real study — smoke logdirs, CSVs, and the db file are not reused by the real study (different `--study-name`), but cleaning up avoids confusion:
+> Trials land in `./logdir/smoke/smoke_trial000`, `…_trial001` (and `smoke_baseline_seed0` if a baseline runs); CSVs in `./csv_logs/tune_stage{N}_none/` (the db file is `tune_reward_stage{N}_none.db` — keyed by stage+mode, not by `--study-name`). Delete the smoke artifacts before starting the real study (the `smoke` study lives inside that db; cleaning up avoids confusion):
 > ```bash
-> rm -f tune_reward_stage1.db
-> rm -rf logdir/smoke/ csv_logs/tune_stage1/
+> rm -f tune_reward_stage1_none.db
+> rm -rf logdir/smoke/ csv_logs/tune_stage1_none/
 > ```
 
 **Validation protocol (declares the winner):** take the printed weights and re-run at **full budget** with `dreamer.py` directly — 3 seeds on stage 1, then stages 2–4 with the same weights to test transfer:
@@ -292,12 +292,6 @@ The preferred monitoring tool is the Streamlit dashboard:
 cd ~/turtlebot-dreamerv3/dreamerv3-torch/dashboard
 streamlit run app.py
 ```
-+-
-- 
-
-+-'[]
-*
-live_chart.py` is no longer used.
 
 Every `st.plotly_chart` / `st.dataframe` in the per-run sections (`_section_resource`, `_section_planner`) and the combined sections (`_section_bb`, `_section_wb`) passes a unique `key=` (e.g. `res_{run_name}_{y_col}`, `plan_{run_name}`, `bb_{col}`, `wb_{title}`). This avoids `StreamlitDuplicateElementId` when multiple runs are selected and rendered in a loop — **add a unique `key=` to any new chart/table** you introduce in those loops.
 
@@ -560,7 +554,7 @@ Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.cs
 
 `run_name` is derived from the final component of `--logdir` in `make_env()`.
 
-**CSV base directory:** all per-run CSVs are written under `config.csv_dir`, a config/CLI knob threaded through `make_env` → `Turtle` → `Env.init_properties` and `ResourceLogger`, **and into `tools.Logger` via `dreamer.py` for the whitebox CSV**. The config default is `./csv_logs`, but `dreamer.py main()` auto-redirects it to a per-mode-per-stage subfolder `./csv_logs/{odometry_mode}_stage{N}/` (and `plots_dir` likewise) unless the user passes an explicit `--csv_dir` / `--plots_dir` — see [Auto-organized run folders](#auto-organized-run-folders). Only the base directory is auto-set — the `{type}_{run_name}.csv` filenames, train/eval routing, and resume logic are unchanged. `tune_reward.py` sets `--csv_dir ./csv_logs/tune_stage{N}[_{mode}]` (an explicit override, so the auto-folder is skipped) to keep BO-trial CSVs in their own per-stage (and per-odometry-mode) subfolder; the dashboard's sidebar folder picker reads `csv_logs/` or any subfolder.
+**CSV base directory:** all per-run CSVs are written under `config.csv_dir`, a config/CLI knob threaded through `make_env` → `Turtle` → `Env.init_properties` and `ResourceLogger`, **and into `tools.Logger` via `dreamer.py` for the whitebox CSV**. The config default is `./csv_logs`, but `dreamer.py main()` auto-redirects it to a per-mode-per-stage subfolder `./csv_logs/{odometry_mode}_stage{N}/` (and `plots_dir` likewise) unless the user passes an explicit `--csv_dir` / `--plots_dir` — see [Auto-organized run folders](#auto-organized-run-folders). Only the base directory is auto-set — the `{type}_{run_name}.csv` filenames, train/eval routing, and resume logic are unchanged. `tune_reward.py` sets `--csv_dir ./csv_logs/tune_stage{N}_{mode}` (an explicit override, so the auto-folder is skipped) to keep BO-trial CSVs in their own per-stage-per-odometry-mode subfolder; the dashboard's sidebar folder picker reads `csv_logs/` or any subfolder.
 
 > **Whitebox now honours `csv_dir` (fixed 2026-06-09).** Previously `tools.Logger` hardcoded the whitebox path to `./csv_logs/whitebox_{run}.csv`, so it split from the other CSVs on `--csv_dir`-redirected (tuner) runs. It now writes `{csv_dir}/whitebox_{run}.csv`, co-located with blackbox/planning/reward/resource. **Files written before the fix stay where they were** — Python loads `tools.py` once per process, so a run already in flight keeps the old path until it restarts; only new/next subprocesses pick up the change.
 

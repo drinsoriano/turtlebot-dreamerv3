@@ -1721,8 +1721,8 @@ python3 export_tune_results.py --stage 1
         ("--timeout-per-trial", "86400",                    "sec (24 h); a timed-out trial is scored on partial data"),
         ("--run-baseline",      "(flag)",                   "run the default-reward baseline (sets the floor)"),
         ("--baseline-success",  "None",                     "skip baseline; give the floor success % directly"),
-        ("--csv-dir",           "./csv_logs/tune_stage{N}[_{mode}]", "per-stage CSV subfolder (mode-suffixed if non-none)"),
-        ("--study-name",        "reward_stage{N}[_{mode}]", "Optuna study + db name (mode-suffixed if non-none)"),
+        ("--csv-dir",           "./csv_logs/tune_stage{N}_{mode}", "per-stage-per-mode CSV subfolder (incl. _none)"),
+        ("--study-name",        "reward_stage{N}_{mode}", "Optuna study + db name (mode-suffixed, incl. _none)"),
         ("--dry-run",           "(flag)",                   "print the dreamer.py commands only; no training"),
     ], columns=["flag", "default", "notes"])
     st.dataframe(bo_params, width="stretch", hide_index=True, key="cmd_params_bo")
