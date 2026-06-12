@@ -396,6 +396,8 @@ python3 dreamer.py \
 
 Adds 2D linear acceleration from `/imu` on top of `full` odometry (7-dim `odometry` key). `/imu` is already published by the burger SDF on every stage — no Gazebo/SDF change needed. Use a **fresh logdir** (`.npz`/checkpoints are not compatible across odometry modes).
 
+**Keep IMU-ablation CSVs/plots organized in a subfolder** (mirrors how BO trials use `csv_logs/tune_stage{N}/`): pass `--csv_dir ./csv_logs/imu_stage{n}` and `--plots_dir ./path_plots/imu_stage{n}`. Without these flags a plain `dreamer.py` run writes flat into `csv_logs/` (correct but mixes with other runs). The dashboard's sidebar folder picker lists the `imu_stage{N}` subfolder just like `tune_stage{N}`.
+
 Smoke test:
 ```bash
 cd ~/turtlebot-dreamerv3/dreamerv3-torch
@@ -404,7 +406,8 @@ python3 dreamer.py \
   --configs turtle --task turtle \
   --logdir ./logdir/gpu_smoke_stage{n}_full_imu_seed0 \
   --stage {n} --lidar 360 --odometry_mode full_imu --seed 0 \
-  --device cuda --steps 5000 --eval_episode_num 2
+  --device cuda --steps 5000 --eval_episode_num 2 \
+  --csv_dir ./csv_logs/imu_stage{n} --plots_dir ./path_plots/imu_stage{n}
 ```
 
 Full training:
@@ -415,10 +418,11 @@ python3 dreamer.py \
   --configs turtle --task turtle \
   --logdir ./logdir/stage{n}_360_full_imu_seed0 \
   --stage {n} --lidar 360 --odometry_mode full_imu --seed 0 \
-  --device cuda --steps 300000 --eval_episode_num 100
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --csv_dir ./csv_logs/imu_stage{n} --plots_dir ./path_plots/imu_stage{n}
 ```
 
-Verify `/imu` is live first (Gazebo running): `ros2 topic echo /imu --once` should show a populated `linear_acceleration`. The `full_imu` run logs `imu_enabled=True` and `sensor_config_id=lidar360_full_imu` in `resource_{run_name}.csv`, and `odometry_mode=full_imu` in `blackbox_{run_name}.csv`.
+Verify `/imu` is live first (Gazebo running): `ros2 topic echo /imu --once` should show a populated `linear_acceleration`. The `full_imu` run logs `imu_enabled=True` and `sensor_config_id=lidar360_full_imu` in `resource_{run_name}.csv`, and `odometry_mode=full_imu` in `blackbox_{run_name}.csv` (under the `--csv_dir` subfolder).
 
 Resource logging is **on by default** (`resource_logging: true` in `configs.yaml`) — no flag needed. To disable: add `--resource_logging False`.
 
