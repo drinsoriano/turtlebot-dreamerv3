@@ -16,7 +16,7 @@ keys and shapes are:
 | `sensor_readings` | `(lidar,)` e.g. `(360,)` | LiDAR range readings, sub-sampled from the raw scan to `lidar` beams; out-of-range values clamped to the maximum range. | hyperbolic tangent |
 | `target` | `(2,)` | Relative goal: `[distance_to_target, angle_to_target]` in the robot frame. | hyperbolic tangent |
 | `velocity` | `(2,)` | Previous commanded velocity: `[linear_vel_cmd, angular_vel_cmd]`. | hyperbolic tangent |
-| `odometry` | `(2,)`, `(3,)`, or `(5,)` | **Optional**, present only when an odometry mode other than `none` is selected. | hyperbolic tangent |
+| `odometry` | `(2,)`, `(3,)`, `(5,)`, or `(7,)` | **Optional**, present only when an odometry mode other than `none` is selected. | hyperbolic tangent |
 
 The number of LiDAR beams is a configuration value (`lidar`, default `360`; a
 reduced setting such as `10` is also supported). The full observation vector that
@@ -47,13 +47,14 @@ and the `Turtle` wrapper slices this vector back into the dictionary keys
   - `twist` -> `[odom_linear_x, odom_angular_z]`, shape `(2,)`
   - `delta` -> `[delta_x_local, delta_y_local, delta_yaw]`, shape `(3,)`
   - `full`  -> twist and delta concatenated, shape `(5,)`
+  - `full_imu` -> `full` plus 2-D robot-frame linear acceleration `[accel_x, accel_y]` from `/imu`, shape `(7,)` (gyro and vertical acceleration excluded; the `/imu` subscription exists only in this mode)
 
 ### Baseline versus odometry-enhanced observation
 
 - **Baseline observation** (`odometry_mode = none`, the default): only
   `sensor_readings`, `target`, and `velocity` are present. No odometry key is
   added; the observation space is unchanged.
-- **Odometry-enhanced observation** (`twist`, `delta`, or `full`): an additional
+- **Odometry-enhanced observation** (`twist`, `delta`, `full`, or `full_imu`): an additional
   `odometry` key is appended with the corresponding shape. This is a separate
   ablation dimension and each mode requires its own training run.
 

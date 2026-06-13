@@ -52,7 +52,7 @@ levers a researcher can vary to study their effect on navigation performance.
 | **LiDAR range readings** | A vector of laser distances around the robot, with out-of-range values clamped to the maximum range. | Yes, observation key `sensor_readings`. |
 | **Relative goal distance and bearing** | The Euclidean distance and the bearing angle from the robot to the goal, computed in the robot frame from odometry pose and the spawned goal. | Yes, observation key `target`. |
 | **Previous commanded velocity** | The linear and angular velocity command issued on the previous step. | Yes, observation key `velocity`. |
-| **Optional odometry features** | An optional appended block of odometry-derived features under modes named twist, delta, or full. | Yes, optional observation key `odometry`. |
+| **Optional odometry features** | An optional appended block of odometry-derived features under modes named twist, delta, full, or full_imu (full_imu also adds 2-D linear acceleration from the IMU). | Yes, optional observation key `odometry`. |
 
 All perception inputs are normalised with a hyperbolic-tangent transform into a
 bounded range before being given to the agent. The raw robot pose itself is

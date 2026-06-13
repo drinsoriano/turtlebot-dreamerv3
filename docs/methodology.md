@@ -39,8 +39,9 @@ the core agent, observation space, and action space remain unchanged:
   2026-06-09 goal-sampler extension).
 - **Reward condition** — a sparse `default` reward or an additive `shaped` reward
   (**implemented**).
-- **Observation condition (odometry ablation)** — four observation variants
-  `none`, `twist`, `delta`, `full` (**implemented**).
+- **Observation condition (odometry ablation)** — five observation variants
+  `none`, `twist`, `delta`, `full`, `full_imu` (**implemented**; `full_imu` adds
+  2-D linear acceleration from `/imu` on top of `full`).
 
 A separate outer-loop **Bayesian-optimisation** procedure can tune the shaped
 reward weights (**implemented**, but as a tuning layer external to the agent —
@@ -93,7 +94,8 @@ ROS2, mediated by `Env(Node)` and `Turtle(gym.Env)` in `envs/turtle.py`.
   five metre arena with six inner walls; stage 8 is a seven and a half by seven
   and a half metre empty arena.
 - **ROS2 interface.** The environment publishes velocity commands to `/cmd_vel`
-  and subscribes to the laser scanner `/scan` and odometry `/odom`. It uses the
+  and subscribes to the laser scanner `/scan` and odometry `/odom` (and the IMU
+  `/imu` in the `full_imu` mode). It uses the
   services `/reset_simulation`, `/spawn_entity`, `/delete_entity`,
   `/pause_physics`, `/unpause_physics`, and entity-state services for the goal
   marker.
@@ -127,6 +129,10 @@ in simulation. The sensor inputs actually used by the agent are:
   relative-goal features and path-length metrics in all configurations, and,
   optionally, to provide an explicit odometry feature block in the observation
   when an odometry mode other than `none` is selected (see Section 5).
+- **Inertial measurement** from `/imu` — used **only** in the `full_imu` odometry
+  mode, contributing 2-D robot-frame linear acceleration (`accel_x`, `accel_y`) to
+  the `(7,)` odometry block. The `/imu` subscription is created only in this mode;
+  gyro and vertical acceleration are excluded (near-zero information on a flat 2-D arena).
 
 The simulation also publishes an IMU topic, but the agent does **not** subscribe
 to it for control, and **no camera or depth sensor is used for control**
@@ -146,7 +152,7 @@ transform into a bounded range before use.
 | `sensor_readings` | `(lidar,)`, default `(360,)` | LiDAR ranges sub-sampled to `lidar` beams; infinities clamped to the maximum range. | `/scan` |
 | `target` | `(2,)` | Relative goal: distance to target and bearing to target in the robot frame, wrapped to plus or minus pi. | derived from `/odom` pose and goal |
 | `velocity` | `(2,)` | Previous **commanded** linear and angular action, not measured velocity. | previous action |
-| `odometry` | `(2,)`, `(3,)`, or `(5,)` | **Optional**, present only when the odometry mode is not `none`. | `/odom` |
+| `odometry` | `(2,)`, `(3,)`, `(5,)`, or `(7,)` | **Optional**, present only when the odometry mode is not `none`. | `/odom` (and `/imu` for `full_imu`) |
 
 Internally the environment builds a flat vector of length `lidar + 4`, composed of
 the LiDAR readings followed by distance to target, bearing to target, linear
@@ -162,6 +168,7 @@ only by the optional `odometry` key:
 | `twist` | `(2,)` | Odometry linear x and angular z. |
 | `delta` | `(3,)` | Local-frame delta x, delta y, delta yaw. |
 | `full` | `(5,)` | Twist and delta concatenated. |
+| `full_imu` | `(7,)` | `full` plus 2-D robot-frame linear acceleration (`accel_x`, `accel_y`) from `/imu`. Gyro and vertical acceleration are excluded (near-zero information on a flat 2-D arena). |
 
 A non-encoded `image` entry filled with zeros and the boolean flags `is_first`,
 `is_last`, and `is_terminal` are also returned, but `image` is **not** part of
@@ -248,7 +255,7 @@ pattern is:
 ```
 python3 dreamer.py --configs turtle --task turtle \
   --logdir ./logdir/<run_name> \
-  --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full> \
+  --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full|full_imu> \
   --seed <S> --device <cpu|cuda> [--steps <int>] [--eval_episode_num <int>] \
   [--reward_mode <default|shaped>] [--reward_* <float> ...]
 ```
@@ -274,7 +281,7 @@ The training procedure proceeds as follows:
    | `discount` | 0.997 | Reward discount factor. |
    | `discount_lambda` | 0.95 | Lambda-return mixing. |
    | `imag_horizon` | 15 | Imagined-rollout length. |
-   | `eval_every` | 5000 | Evaluation cadence in steps. |
+   | `eval_every` | 20000 (`2e4`) | Evaluation cadence in steps (was 5000 before the 2026-06-12 `% 4` removal; the multiplier `5000 × 4` is now folded into the single value). |
    | `eval_episode_num` | 100 | Evaluation episodes per checkpoint. |
 
 2. **Initialisation and prefill.** Two environments are built — a training
@@ -354,7 +361,7 @@ fixed.
 |---|---|---|---|---|
 | Independent | Arena stage | Stage number 1 to 8 selecting arena size and obstacle layout. | `--stage`; `STAGE_ARENAS` and `_sample_target_position` (stages 1 to 8). | Manipulated difficulty condition. |
 | Independent | Reward mode | `default` sparse reward or `shaped` additive reward. | `reward_mode` in `configs.yaml`; branch in `get_reward_and_done`. | Reward intervention condition. |
-| Independent | Observation mode (odometry ablation) | `none`, `twist`, `delta`, or `full` odometry feature block. | `odometry_mode`; observation-space branches in `turtle.py`. | Perception-input condition. |
+| Independent | Observation mode (odometry ablation) | `none`, `twist`, `delta`, `full`, or `full_imu` odometry feature block (`full_imu` = `full` + 2-D `/imu` linear acceleration). | `odometry_mode`; observation-space branches in `turtle.py`. | Perception-input condition. |
 | Independent | LiDAR resolution | Number of LiDAR beams (`lidar`, default 360). | `lidar` config; sub-sampling in `get_state`. | Perception-fidelity condition. |
 | Independent | Random seed | Integer seed for reproducibility across runs. | `seed` config. | Repetition and variance control. |
 | Independent (outer loop) | Shaped-reward weights | Five scalar weights tuned by Optuna. | `tune_reward.py`, `--reward_*` flags. | Tuning of the shaping intervention. |
@@ -472,7 +479,7 @@ quantity (no analysis is proposed for a metric that is not logged):
 - **Path quality.** Compare A-star path efficiency (primary) and path directness
   (secondary) across conditions to assess shortest-path behaviour.
 - **Comparison across observation modes.** Compare the dependent variables across
-  the odometry modes `none`, `twist`, `delta`, and `full`, holding stage, reward
+  the odometry modes `none`, `twist`, `delta`, `full`, and `full_imu`, holding stage, reward
   mode, and seed fixed; the learning algorithm is identical and only the observation
   input changes.
 - **Comparison across reward modes and stages.** Compare `default` versus `shaped`

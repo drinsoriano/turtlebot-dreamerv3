@@ -66,7 +66,8 @@ actor with no updates. See
 
 ## c. Architecture framework (summary)
 Three layers: (1) the **ROS2/Gazebo simulation** with the TurtleBot3 robot,
-publishing `/cmd_vel` and subscribing to `/scan` and `/odom`; (2) the
+publishing `/cmd_vel` and subscribing to `/scan` and `/odom` (and `/imu` in the
+`full_imu` mode); (2) the
 **environment wrapper** (`Env` ROS2 node plus `Turtle` Gym adapter) that builds
 observations, computes reward and termination, samples goals, and logs metrics;
 and (3) the **DreamerV3 agent** (MLP encoder, RSSM latent dynamics,
@@ -88,7 +89,7 @@ outcomes). See [conceptual_framework.md](conceptual_framework.md).
 | Observation | `sensor_readings` (LiDAR) | `(lidar,)`, default `(360,)` |
 | Observation | `target` (distance, bearing) | `(2,)` |
 | Observation | `velocity` (previous command) | `(2,)` |
-| Observation | `odometry` (optional) | `(2,)`, `(3,)`, or `(5,)` |
+| Observation | `odometry` (optional) | `(2,)`, `(3,)`, `(5,)`, or `(7,)` |
 | Action | throttle | `[0, 1]` |
 | Action | steering | `[-1, 1]` |
 
@@ -102,7 +103,7 @@ See [observation_and_action_space.md](observation_and_action_space.md).
 |---|---|---|
 | Independent | Arena stage | Stage 1 to 8 (arena size and obstacle layout), `--stage`. |
 | Independent | Reward mode | `default` sparse or `shaped` additive reward. |
-| Independent | Observation mode | Odometry ablation `none`, `twist`, `delta`, `full`. |
+| Independent | Observation mode | Odometry ablation `none`, `twist`, `delta`, `full`, `full_imu` (`full_imu` = `full` + 2-D `/imu` linear acceleration). |
 | Independent | LiDAR resolution / seed | Beam count (`lidar`) and random `seed`. |
 | Independent (outer loop) | Shaped-reward weights | Five weights tuned by Optuna, external to the agent. |
 | Intervening | DreamerV3 mechanism | World-model learning, imagination, actor-critic improvement. |
@@ -152,7 +153,7 @@ study intent — confirm before finalising thesis text:
    weight search should be presented as a core contribution or as an optional
    extension of the baseline DreamerV3 study.
 3. **Odometry ablation.** Whether the optional odometry observation modes
-   (twist/delta/full) are part of the current thesis scope or a separate study.
+   (twist/delta/full/full_imu) are part of the current thesis scope or a separate study.
 4. **Episode horizon.** The configured per-episode step limit and action-repeat
    setting, which together set the maximum episode length, should be stated
    explicitly in the methodology.

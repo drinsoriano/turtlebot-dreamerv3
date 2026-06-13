@@ -286,7 +286,8 @@ PNG overhead plots are generated per episode under `dreamerv3-torch/path_plots/{
 - Goal acceptance circle (dashed red, radius = 0.4 m = `REACH_THRESHOLD`)
 - Goal fill region (light red)
 - Robot trajectory (orange)
-- Start position (green circle)
+- Robot **start pose** — green TurtleBot3 Burger marker (to-scale 0.105 m footprint, body + 2 wheels + heading arrow)
+- Robot **final pose** — dark-grey Burger marker (same style; sits where the trajectory ended, e.g. on the 0.4 m goal boundary for a success)
 - Goal centre (red star)
 
 **Circular Gazebo goal marker:** The visual marker spawned in Gazebo was changed from a flat plane (square) to a cylinder matching the goal acceptance radius. This is visual-only — it has no effect on collision detection, LiDAR readings, reward, observation space, or training logic.
@@ -374,7 +375,7 @@ Expected: numpy 2.x, matplotlib from `~/.local/`, CUDA True, RTX 5060 Ti.
 - More impactful levers:
   - `--device cuda` — GPU training
   - `--eval_episode_num N` — fewer eval episodes per checkpoint = less wall-clock pause
-  - `--eval_every N` — the **evaluation interval in steps** (default `20000` = eval every 20k). Evaluation runs **once per `eval_every` steps** — `eval_every` is the single control (the hardcoded `% 4` multiplier was removed 2026-06-12; see [docs/evaluation_loop.md](docs/evaluation_loop.md)). **Lower** it (e.g. `--eval_every 5000`) for a finer learning curve; **raise** it for fewer eval pauses.
+  - `--eval_every N` — the **evaluation interval in steps** (default `20000` = eval every 20k). Evaluation runs **once per `eval_every` steps** — `eval_every` is the single control (the hardcoded `% 4` multiplier was removed 2026-06-12; see [docs/evaluation_loop.md](docs/evaluation_loop.md)). **Lower** it (e.g. `--eval_every 5000`) for a finer learning curve; **raise** it for fewer eval pauses. **Training stops exactly at `--steps`** (fixed 2026-06-13): the loop still evaluates the model *at* `config.steps`, but a `break` fires right after that final eval so there is **no wasted `eval_every`-sized training tail** past `--steps` (previously `--steps 80000` actually trained ~100k). Eval checkpoints and BO scoring are unchanged.
 - **`eval_episode_num` guidance:**
   - `2` — smoke test / fast iteration only
   - `100` — preferred for real training and final result reporting

@@ -76,7 +76,8 @@ The physical substrate is a Gazebo simulation of a **TurtleBot3 burger** robot i
 a stage arena. The agent interacts with it exclusively through ROS2:
 
 - **Subscribed sensor topics:** `/scan` (LiDAR ranges) and `/odom` (pose and
-  twist).
+  twist); plus `/imu` (2-D linear acceleration) **only** in the `full_imu` odometry
+  mode (conditional — other modes do not subscribe to `/imu`).
 - **Published command topic:** `/cmd_vel` (a `geometry_msgs/Twist` with linear
   and angular velocity).
 - **Services used:** `/reset_simulation`, `/spawn_entity`, `/delete_entity`,

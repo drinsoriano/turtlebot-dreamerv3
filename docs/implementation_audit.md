@@ -47,7 +47,7 @@ implementation**).
 
 | File Path | Purpose | Evidence Found | Confidence |
 |---|---|---|---|
-| `dreamerv3-torch/dreamer.py` | Training/eval entry point; `Dreamer` agent; `make_env`; main loop; config/CLI merge. | `class Dreamer` (l.29), `make_env` (l.147), `main` loop (l.275–316), argparse auto-register (l.345–348). | implemented |
+| `dreamerv3-torch/dreamer.py` | Training/eval entry point; `Dreamer` agent; `make_env`; main loop; config/CLI merge. | `class Dreamer` (l.29), `make_env` (l.147), `main` loop (l.286–335, break-at-`config.steps` l.317), argparse auto-register (l.345–348). | implemented |
 | `dreamerv3-torch/configs.yaml` | `defaults` + `turtle` config blocks (model, training, behavior, reward, env). | Whole file; `turtle:` block (l.107–122). | implemented |
 | `dreamerv3-torch/envs/turtle.py` | ROS2 `Env(Node)` + `Turtle(gym.Env)`: obs/action spaces, reward, termination, goal sampling, CSV logging. | `class Env(Node)` (l.55), `class Turtle(gym.Env)` (l.810). | implemented |
 | `dreamerv3-torch/models.py` | `WorldModel` (encoder, RSSM, decoder/reward/cont heads) and `ImagBehavior` (actor/critic over imagined rollouts). | `class WorldModel` (l.29), `class ImagBehavior` (l.213), `_imagine` (l.344), `_compute_target` (l.364). | implemented |
@@ -73,7 +73,7 @@ canonical command pattern (from `dreamer.py` and `configs.yaml`):
 ```
 python3 dreamer.py --configs turtle --task turtle \
   --logdir ./logdir/<run_name> \
-  --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full> \
+  --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full|full_imu> \
   --seed <S> --device <cpu|cuda> [--steps <int>] [--eval_episode_num <int>] \
   [--reward_mode <default|shaped>] [--reward_* <float> ...]
 ```
@@ -101,7 +101,7 @@ Parameters found that are relevant to the requested list:
 | `seed` | yes | `0` | l.8 |
 | `steps` | yes | `300000` / `600000` | l.10 / l.108 |
 | `prefill` | yes | `500` | l.39 |
-| `eval_every` | yes | `5000` | l.12 |
+| `eval_every` | yes | `20000` (`2e4`) | l.12 |
 | `eval_episode_num` | yes | `100` | l.13 |
 | `time_limit` | yes | `250` | l.38 |
 | `reward_mode` | yes | `default` | l.29 |
@@ -126,7 +126,7 @@ Additional blocks present (**implemented**): world-model/RSSM (`dyn_deter: 256`,
 
 - `Env(Node)` is a `rclpy` ROS2 node (`turtle.py` l.55).
 - **Publishes:** `/cmd_vel` (`geometry_msgs/Twist`) — l.64, `publish_vel` l.377.
-- **Subscribes:** `/scan` (`LaserScan`) and `/odom` (`Odometry`) — l.65–66.
+- **Subscribes:** `/scan` (`LaserScan`) and `/odom` (`Odometry`) — l.65–66; plus `/imu` (`sensor_msgs/Imu`) **only** when `odometry_mode == 'full_imu'` (conditional subscription, so other modes stay zero-overhead).
 - **Service clients:** `/reset_simulation`, `/spawn_entity`, `/delete_entity`,
   `/pause_physics`, `/unpause_physics`, and `/demo/get_entity_state` /
   `/demo/set_entity_state` — l.67–73.
@@ -153,7 +153,7 @@ l.825–850) and `Env.get_state` (l.253–315). The observation is a **`gym.spac
 | `sensor_readings` | `(lidar,)`, default `(360,)` | LiDAR ranges, sub-sampled to `lidar` beams; `inf` clamped to `LIDAR_MAX_RANGE = 3.5` (l.273). | l.826–829 |
 | `target` | `(2,)` | `[distance_to_target, angle_to_target]` (bearing in robot frame, wrapped to ±π). | l.830–833; computed l.265–268 |
 | `velocity` | `(2,)` | `[linear_vel_cmd, angular_vel_cmd]` — the **previous commanded** action. | l.834–837; l.296 |
-| `odometry` | `(2,)` / `(3,)` / `(5,)` | **Optional**, present only when `odometry_mode != none`. | l.842–850 |
+| `odometry` | `(2,)` / `(3,)` / `(5,)` / `(7,)` | **Optional**, present only when `odometry_mode != none`. | l.842–850 |
 
 The full internal state vector is `lidar + [distance, angle, lin_vel, ang_vel]`
 and is squashed with `tanh` before use (l.296–297); `Turtle.step` slices it back
@@ -256,6 +256,7 @@ names and shapes extracted from `turtle.py` (l.275–294 and l.842–850):
 | `twist` | `(2,)` | `[odom_linear_x, odom_angular_z]` (l.289). |
 | `delta` | `(3,)` | `[delta_x_local, delta_y_local, delta_yaw]` in robot frame (l.291). |
 | `full` | `(5,)` | twist and delta concatenated (l.293). |
+| `full_imu` | `(7,)` | `full` plus `[accel_x, accel_y]` — 2-D robot-frame linear acceleration from `/imu` (gyro and `accel_z` excluded). The `/imu` subscription is created **only** for this mode. |
 
 The odometry block is `tanh`-normalised (l.294) and appended as a separate
 `odometry` observation key only when the mode is not `none`. Separate
@@ -379,7 +380,7 @@ Features confirmed implemented and safe to include in a methodology:
 5. **Sparse default reward** plus an **opt-in additive shaped reward**.
 6. **Three terminal conditions** (success/collision/timeout) with a config-driven
    step horizon.
-7. **Odometry ablation modes** (`none/twist/delta/full`).
+7. **Odometry ablation modes** (`none/twist/delta/full/full_imu`).
 8. **Black-box and white-box metric logging**, plus reward-component and resource
    logging, with train/eval separation.
 9. **A\* post-hoc path-efficiency metric** (region + centre variants) and path

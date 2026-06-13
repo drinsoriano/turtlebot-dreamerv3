@@ -45,7 +45,7 @@ obstacle complexity are used to study how navigation behaviour generalises.
 The environment is a Gazebo simulation driven through ROS2. The agent process
 communicates with the simulator over standard ROS2 interfaces: it **publishes
 velocity commands** to `/cmd_vel` and **subscribes to** the laser scanner
-`/scan` and odometry `/odom`. Goals are spawned and removed as visual marker
+`/scan` and odometry `/odom` (plus the IMU `/imu` in the `full_imu` mode). Goals are spawned and removed as visual marker
 entities, and each episode begins by resetting the simulation. This is
 implemented in `Env(Node)` in `envs/turtle.py`.
 

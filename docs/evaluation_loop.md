@@ -6,11 +6,19 @@ evaluation happens, and every parameter that controls it. Grounded on
 [configs.yaml](../dreamerv3-torch/configs.yaml).
 
 > **Changed 2026-06-12:** the hardcoded `ctr % 4` multiplier was removed
-> ([dreamer.py:278](../dreamerv3-torch/dreamer.py#L278)) so **`eval_every` alone
+> ([dreamer.py:294](../dreamerv3-torch/dreamer.py#L294)) so **`eval_every` alone
 > controls the evaluation interval** — one clean knob. The default `eval_every`
 > is **20,000** steps ([configs.yaml:12](../dreamerv3-torch/configs.yaml#L12),
 > `2e4`), which preserves the original effective interval (the old code used
 > `5,000 × 4 = 20,000`). **Lower** `eval_every` for a finer learning curve.
+>
+> **Changed 2026-06-13:** training now **stops exactly at `config.steps`**. The loop
+> bound stays `config.steps + eval_every` (so the model *at* `config.steps` still gets
+> evaluated), but a `break` fires **right after that final eval, before training**
+> ([dreamer.py:317](../dreamerv3-torch/dreamer.py#L317)). Previously the loop trained
+> one **extra `eval_every` round past `--steps`** that no eval ever measured (e.g.
+> `--steps 80000` actually trained ~100k — ~20k wasted/run). Eval checkpoints and BO
+> scoring are **unchanged**; only the wasted post-final-eval tail is removed.
 
 ---
 
@@ -44,23 +52,27 @@ flowchart TD
     D -->|"OO — kada iteration<br/>= kada eval_every (20,000) steps"| E["EVALUATE<br/>eval_episode_num episodes"]
     E --> F{"eval return > best?"}
     F -->|OO| G["Save best.pt + best.csv"]
-    F -->|Hindi| H["TRAIN: eval_every (20,000) steps"]
-    G --> H
-    D -->|"Hindi (eval disabled)"| H
+    F -->|Hindi| Z
+    G --> Z{"agent step ≥ steps?<br/>(final-budget eval tapos na)"}
+    D -->|"Hindi (eval disabled)"| Z
+    Z -->|"OO — break"| K([Tapos<br/>training tigil sa config.steps])
+    Z -->|"Hindi"| H["TRAIN: eval_every (20,000) steps"]
     H --> I["Save latest.pt"]
-    I --> J{"agent step <<br/>steps + eval_every?"}
-    J -->|OO, ulit| C
-    J -->|Hindi na| K([Tapos])
+    I --> C
 ```
 
-Source: [dreamer.py:275-316](../dreamerv3-torch/dreamer.py#L275).
+Source: [dreamer.py:286-335](../dreamerv3-torch/dreamer.py#L286).
 
 Key points:
-- **Prefill runs once** ([dreamer.py:222](../dreamerv3-torch/dreamer.py#L222)) — 500 random steps, no learning.
+- **Prefill runs once** ([dreamer.py:263](../dreamerv3-torch/dreamer.py#L263)) — 500 random steps, no learning.
 - **Eval happens before training** within each iteration, **every iteration**
-  ([dreamer.py:278](../dreamerv3-torch/dreamer.py#L278)) — i.e. every `eval_every` (20,000) steps.
+  ([dreamer.py:294](../dreamerv3-torch/dreamer.py#L294)) — i.e. every `eval_every` (20,000) steps.
+- **Training stops exactly at `config.steps`**: after the final-budget eval, a `break`
+  fires before the next training round ([dreamer.py:317](../dreamerv3-torch/dreamer.py#L317)),
+  so there is **no wasted `eval_every`-sized tail** past `--steps` (changed 2026-06-13).
 - **`best.pt`** is saved only when the mean eval return beats the previous best;
-  **`latest.pt`** is saved every iteration.
+  **`latest.pt`** is saved after each **training** round (so it reflects the
+  `config.steps` model, not a post-budget overshoot).
 - The first eval (`ctr=0`) runs on an **untrained** agent (post-prefill) — one
   throwaway at the very start.
 
@@ -82,10 +94,12 @@ n_evals ≈ steps / eval_every + 1   =   steps / 20,000 + 1
 | 600,000 | ~31 | ~620 (eval=20) / ~3,100 (eval=100) |
 
 **Alignment:** since the interval is 20k, the eval marks land at multiples of
-20,000. A budget that is **not** a multiple of 20k (e.g. 50,000) leaves its tail
-between two eval marks, and the loop also trains up to one extra `eval_every`
-round past `--steps` (the loop bound is `steps + eval_every`). Prefer `--steps`
-as a **multiple of 20,000** (40k, 60k, 300k, …) for clean alignment.
+20,000. As of **2026-06-13**, training **stops exactly at `config.steps`** — the loop
+breaks right after the final-budget eval ([dreamer.py:317](../dreamerv3-torch/dreamer.py#L317)),
+so there is **no extra training round past `--steps`** (the old behavior trained up to
+one more `eval_every` round, i.e. `--steps 80000` actually ran ~100k). Prefer `--steps`
+as a **multiple of 20,000** (40k, 60k, 300k, …) so the final eval lands exactly on the
+budget instead of mid-interval.
 
 ---
 
@@ -154,6 +168,10 @@ flowchart LR
 - Para sa **mas pinong curve**, **babaan** ang `eval_every` (hal. `--eval_every 5000`
   → 9 evals sa 40k). Para sa **mas kaunting pause**, itaas.
 - Ang **unang eval (ctr=0)** ay untrained pa — isang throwaway lang sa umpisa.
+- **Training tigil sa `config.steps`** (mula 2026-06-13): pagkatapos ng final eval, may
+  `break` bago mag-train ulit — kaya **walang sayang na `eval_every`-sized na tail** lampas
+  sa `--steps` (dati, ang `--steps 80000` ay totoong nag-train ng ~100k). Hindi nagbabago
+  ang eval checkpoints o BO scoring — ang sayang na tail lang ang tinanggal.
 - **BO trials:** hindi ipinapasa ng tuner ang `--eval_every`, kaya 20,000 (default).
   Ang `SCORE_WINDOW = 60` ay nag-i-score sa **huling 3 trained evals** — kaya gamitin
   ang **`--steps ≥80000`** sa BO (80k → 5 evals; window 60 = 40k/60k/80k, excluded
