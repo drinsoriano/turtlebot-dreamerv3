@@ -155,6 +155,7 @@ Shaping is **opt-in** via `--reward_mode`. The original reward is preserved exac
 |---|---|
 | `default` (default) | Original sparse reward, **byte-for-byte unchanged**: `+100` goal, `−10` collision, `−10` timeout, `0` otherwise |
 | `shaped` | Original terminal rewards **plus** the additive shaping terms below, applied every step |
+| `pbrs` | Original terminal rewards **plus** a single potential-based shaping term (see [Relative Distance and Angular PBRS](#relative-distance-and-angular-pbrs-reward_modepbrs)). Does **not** apply the RS-1…RS-4 additive terms |
 
 Shaped reward `= reward_default + progress + step_pen + turn_pen + near_obst`:
 
@@ -169,17 +170,42 @@ Shaped reward `= reward_default + progress + step_pen + turn_pen + near_obst`:
 
 Weights are kept **mild by default** — progress is deliberately weak so complex stages can still take temporary detours around obstacles. All knobs are CLI-overridable.
 
-**Component logging:** per-episode component sums are written to `csv_logs/reward_{run_name}.csv` (eval → `reward_eval_{run_name}.csv`) with columns `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total`. Written in **both** modes; in `default` mode the shaping columns are `0` and `sum_total == sum_terminal`. The blackbox/planning/whitebox/resource CSV schemas are unchanged.
+**Component logging:** per-episode component sums are written to `csv_logs/reward_{run_name}.csv` (eval → `reward_eval_{run_name}.csv`) with columns `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total, sum_pbrs, sum_pbrs_phi_current, sum_pbrs_phi_next, sum_pbrs_distance_component, sum_pbrs_angle_component`. Written in **all three** modes; the shaping columns are `0` in any mode that does not use them (e.g. in `default` all are `0` and `sum_total == sum_terminal`; in `shaped` the five `sum_pbrs*` columns are `0`; in `pbrs` the four `sum_progress/step/turn/near` columns are `0`). The five `sum_pbrs*` columns were **appended at the end** (2026-06-13), so pre-PBRS readers and CSVs are unaffected (read by column name). The blackbox/planning/whitebox/resource CSV schemas are unchanged.
 
-**A* planner-guided reward:** Not approved. Do not implement until explicitly scoped. If added later, label the experiment `RS-P` and isolate in a separate sub-experiment logdir.
+**A* planner-guided reward:** Not approved. Do not implement until explicitly scoped. If added later, label the experiment `RS-P` and isolate in a separate sub-experiment logdir. **PBRS does not use A\*** — its potential is the relative goal distance/angle already in the observation; A\* stays a post-hoc metric only.
+
+### Relative Distance and Angular PBRS (`reward_mode=pbrs`)
+
+A third, opt-in reward mode added on branch `reward-pbrs` (2026-06-13). It augments the **unchanged** terminal reward with a single **potential-based reward shaping** (PBRS) term. PBRS (Ng, Harada & Russell, 1999) is **policy-invariant**: adding `F(s,s') = γ·Φ(s') − Φ(s)` provably does **not** change the optimal policy *when `γ` equals the agent's discount* (`discount: 0.997` in `configs.yaml`). This is its theoretical edge over the hand-weighted additive `shaped` terms — it densifies the reward (faster credit assignment toward the goal) **without** biasing which policy is optimal.
+
+PBRS reward `= reward_default + r_pbrs`, where:
+
+```
+r_pbrs = pbrs_scale · (pbrs_gamma · Φ(s_{t+1}) − Φ(s_t))
+Φ(s)   = −( pbrs_distance_weight · d_norm  +  pbrs_angle_weight · a_norm )
+d_norm = min(distance_to_goal / pbrs_distance_scale, 1.0)        ∈ [0, 1]
+a_norm = (1 − cos(angle_to_goal)) / 2                            ∈ [0, 1]
+```
+
+`distance_to_goal` / `angle_to_goal` are the **same relative goal distance/bearing already computed in `Env.get_state()`** (never the raw pose, never A\*). `Φ ≤ 0` and rises toward `0` as the robot nears **and** faces the goal, so `r_pbrs > 0` for goal-directed progress. The term is computed on the **transition s_t → s_{t+1}**: `prev_distance_to_target` / `prev_angle_to_target` are `s_t`; the fresh `get_state()` values are `s_{t+1}` (mirrors how the `shaped` progress term already uses `prev_distance_to_target`).
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `pbrs_scale` | 1.0 | Overall weight on the shaping term |
+| `pbrs_distance_weight` | 1.0 | Weight of the distance component of `Φ` |
+| `pbrs_angle_weight` | 0.2 | Weight of the heading-alignment component of `Φ` |
+| `pbrs_distance_scale` | 5.0 | Distance normaliser (m). **Fixed**, not stage-aware — keeps `Φ` comparable across stages and never saturates `d_norm` on stages 1–4 (max start→goal ≈ 2.83 m). Lower it for a steeper near-goal gradient |
+| `pbrs_gamma` | 0.997 | PBRS discount. **Keep equal to the agent `discount` (0.997)** to preserve policy invariance |
+
+All knobs are CLI-overridable (auto-registered from `configs.yaml`). Implementation: `_pbrs_potential()` + the `elif self.reward_mode == 'pbrs'` branch in `get_reward_and_done()` ([envs/turtle.py](dreamerv3-torch/envs/turtle.py)); `default`/`shaped` paths are untouched. NaN/inf in distance/angle/prev-values is guarded — that step's `r_pbrs` is `0.0` (training never crashes). The literal `F = γ·Φ(s') − Φ(s)` is applied on every step including terminal (the strict-invariance convention `Φ(terminal)=0` is **not** enforced; the ±terminal reward dominates terminal steps regardless). Per-episode sums of `r_pbrs`, `Φ(s_t)`, `Φ(s_{t+1})`, and the `d_norm` / `a_norm` components are logged to the five `sum_pbrs*` reward-CSV columns above.
 
 ### Logdir naming convention for reward-shaping experiments
 
 ```
-./logdir/stage{N}_360_none_seed{S}_reward_{default|shaped}
+./logdir/stage{N}_360_none_seed{S}_reward_{default|shaped|pbrs}
 ```
 
-Example: `stage1_360_none_seed0_reward_shaped` for the shaped run on stage 1, `stage1_360_none_seed0_reward_default` for the no-shaping baseline. Replace `{N}` with the target stage number.
+Example: `stage1_360_none_seed0_reward_shaped` for the shaped run on stage 1, `stage1_360_none_seed0_reward_pbrs` for the PBRS run, `stage1_360_none_seed0_reward_default` for the no-shaping baseline. Replace `{N}` with the target stage number. As with odometry modes, use a **fresh logdir** when switching reward mode.
 
 ### Measuring improvement
 
@@ -432,6 +458,19 @@ python3 dreamer.py \
   --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
 ```
 
+**GPU training — PBRS reward (branch `reward-pbrs`):**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+
+python3 dreamer.py \
+  --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_pbrs \
+  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode pbrs
+```
+Defaults (`pbrs_scale=1.0`, `pbrs_distance_weight=1.0`, `pbrs_angle_weight=0.2`, `pbrs_distance_scale=5.0`, `pbrs_gamma=0.997`) are CLI-overridable, e.g. `--pbrs_angle_weight 0.3`. See [Relative Distance and Angular PBRS](#relative-distance-and-angular-pbrs-reward_modepbrs).
+
 **IMU ablation — `full_imu` mode (branch `imu-observation`):**
 
 Adds 2D linear acceleration from `/imu` on top of `full` odometry (7-dim `odometry` key). `/imu` is already published by the burger SDF on every stage — no Gazebo/SDF change needed. Use a **fresh logdir** (`.npz`/checkpoints are not compatible across odometry modes).
@@ -567,7 +606,7 @@ Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.cs
 >
 > **`eval_success_rate` / `eval_collision_rate` (fixed 2026-06-09):** scored from the terminal **outcome label** (`tools.simulate` reads `info['outcome']` surfaced by `Turtle.step`), so they are correct under **shaped** reward and keep **timeout out of the collision count**. The old code compared episode reward to `100`/`-10`, which read `0` in shaped mode and folded timeouts into collisions. **For reported success/collision rates use `blackbox_eval_*` — it is the authoritative source in both reward modes.** CSVs logged before the fix (e.g. earlier tuner trials) still contain the buggy `0` values. See `docs/whitebox_data_validation.md`.
 
-**`reward_*` columns:** `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total`. Written in **both** modes — in `default` mode the shaping columns are `0` and `sum_total == sum_terminal`.
+**`reward_*` columns:** `datetime, reward_mode, stage, episode, outcome, sum_terminal, sum_progress, sum_step_penalty, sum_turn_penalty, sum_near_obstacle, sum_total, sum_pbrs, sum_pbrs_phi_current, sum_pbrs_phi_next, sum_pbrs_distance_component, sum_pbrs_angle_component`. Written in **all three** reward modes; unused shaping columns are `0` (in `default` all shaping columns are `0` and `sum_total == sum_terminal`; in `shaped` the five `sum_pbrs*` are `0`; in `pbrs` the four additive columns are `0`). The five `sum_pbrs*` columns are appended at the end (2026-06-13) — read by column name; pre-PBRS files simply lack them.
 
 **`planning_*` columns:** see **A* Planner-Based Path Efficiency** above; written on `planner-efficiency-metric` branch only.
 

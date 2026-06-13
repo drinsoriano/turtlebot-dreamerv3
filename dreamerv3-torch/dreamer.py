@@ -167,6 +167,11 @@ def make_env(config, mode, id):
         reward_turn_penalty=config.reward_turn_penalty,
         reward_near_obstacle_scale=config.reward_near_obstacle_scale,
         reward_near_obstacle_sigma=config.reward_near_obstacle_sigma,
+        pbrs_scale=config.pbrs_scale,
+        pbrs_distance_weight=config.pbrs_distance_weight,
+        pbrs_angle_weight=config.pbrs_angle_weight,
+        pbrs_distance_scale=config.pbrs_distance_scale,
+        pbrs_gamma=config.pbrs_gamma,
         csv_dir=config.csv_dir,
         plots_dir=config.plots_dir,
     )

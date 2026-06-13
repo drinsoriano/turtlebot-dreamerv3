@@ -27,12 +27,22 @@ defaults:
   plots_dir: './path_plots'         # base dir for path-plot PNGs (BO trials use a subfolder)
 
   # Reward shaping (opt-in; default mode = original sparse reward, unchanged)
-  reward_mode: 'default'            # 'default' | 'shaped'
+  reward_mode: 'default'            # 'default' | 'shaped' | 'pbrs'
   reward_progress_scale: 1.0
   reward_step_penalty: 0.01
   reward_turn_penalty: 0.01
   reward_near_obstacle_scale: 0.1
   reward_near_obstacle_sigma: 0.25
+
+  # Potential-based reward shaping (reward_mode='pbrs'). Auxiliary, policy-invariant
+  # (Ng, Harada & Russell 1999) when pbrs_gamma == agent discount (0.997). Φ(s) =
+  # -(distance_weight*d_norm + angle_weight*a_norm); F = pbrs_scale*(γ·Φ(s') − Φ(s)).
+  # distance_scale fixed at 5.0 (comparable across stages; never saturates on 1–4).
+  pbrs_scale: 1.0
+  pbrs_distance_weight: 1.0
+  pbrs_angle_weight: 0.2
+  pbrs_distance_scale: 5.0
+  pbrs_gamma: 0.997
 
   # Environment
   task: 'turtle'

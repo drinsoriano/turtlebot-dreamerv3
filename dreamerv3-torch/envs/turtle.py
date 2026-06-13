@@ -33,6 +33,23 @@ MEDIUM_RATE = 0.1
 MIN_GOAL_DIST = 0.8          # minimum distance from robot reset origin to sampled goal
 MAX_GOAL_SPAWN_ATTEMPTS = 10 # retry limit before falling back to farthest candidate
 
+
+def _pbrs_potential(dist, angle, dist_weight, angle_weight, dist_scale):
+    """Potential Φ(s) for potential-based reward shaping (reward_mode='pbrs').
+
+    Φ(s) = -(dist_weight * d_norm + angle_weight * a_norm), where
+        d_norm = min(dist / dist_scale, 1.0)   ∈ [0, 1]  (0 at the goal)
+        a_norm = (1 - cos(angle)) / 2          ∈ [0, 1]  (0 when facing the goal)
+    Φ is ≤ 0 and rises toward 0 as the robot nears and faces the goal, so the
+    shaping term F = γ·Φ(s') − Φ(s) rewards goal-directed progress. `dist` is the
+    relative goal distance and `angle` the relative goal bearing already computed
+    by Env.get_state(). Caller guards against NaN/inf inputs.
+    """
+    d_norm = min(dist / dist_scale, 1.0)
+    a_norm = (1.0 - math.cos(angle)) / 2.0
+    return -((dist_weight * d_norm) + (angle_weight * a_norm))
+
+
 def generate_target_sdf(x, y, z):
         return f"""
         <?xml version='1.0'?>
@@ -60,6 +77,8 @@ class Env(Node):
                  reward_mode='default', reward_progress_scale=1.0,
                  reward_step_penalty=0.01, reward_turn_penalty=0.01,
                  reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                 pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
+                 pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super().__init__("trainer_node")
 
@@ -84,6 +103,8 @@ class Env(Node):
                              reward_mode, reward_progress_scale,
                              reward_step_penalty, reward_turn_penalty,
                              reward_near_obstacle_scale, reward_near_obstacle_sigma,
+                             pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
+                             pbrs_distance_scale, pbrs_gamma,
                              csv_dir, plots_dir)
 
     def pause_simulation(self):
@@ -112,6 +133,8 @@ class Env(Node):
                         reward_mode='default', reward_progress_scale=1.0,
                         reward_step_penalty=0.01, reward_turn_penalty=0.01,
                         reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                        pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
+                        pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                         csv_dir='./csv_logs', plots_dir='./path_plots'):
         self.num_states = 14
         self.num_actions = 2
@@ -240,9 +263,20 @@ class Env(Node):
         self.reward_turn_penalty = reward_turn_penalty
         self.reward_near_obstacle_scale = reward_near_obstacle_scale
         self.reward_near_obstacle_sigma = reward_near_obstacle_sigma
+        # Potential-based reward shaping (reward_mode='pbrs')
+        self.pbrs_scale = pbrs_scale
+        self.pbrs_distance_weight = pbrs_distance_weight
+        self.pbrs_angle_weight = pbrs_angle_weight
+        self.pbrs_distance_scale = pbrs_distance_scale
+        self.pbrs_gamma = pbrs_gamma
         self.prev_distance_to_target = 0.0
+        self.prev_angle_to_target = 0.0   # PBRS: previous-step (s_t) angle-to-goal
+        self.angle_to_target = 0.0        # set every step in get_state() (s_{t+1})
         self._rc_terminal = self._rc_progress = self._rc_step = 0.0
         self._rc_turn = self._rc_near = self._rc_total = 0.0
+        # PBRS per-episode component sums (logged to reward CSV; 0 in default/shaped)
+        self._rc_pbrs = self._rc_pbrs_phi_current = self._rc_pbrs_phi_next = 0.0
+        self._rc_pbrs_dist = self._rc_pbrs_angle = 0.0
 
         # Reward-components CSV — per-episode component sums (always written, both modes;
         # in 'default' mode the shaping columns are all 0 and sum_total == sum_terminal).
@@ -257,6 +291,9 @@ class Env(Node):
                 'datetime', 'reward_mode', 'stage', 'episode', 'outcome',
                 'sum_terminal', 'sum_progress', 'sum_step_penalty',
                 'sum_turn_penalty', 'sum_near_obstacle', 'sum_total',
+                # PBRS columns (appended; 0.0 in default/shaped modes)
+                'sum_pbrs', 'sum_pbrs_phi_current', 'sum_pbrs_phi_next',
+                'sum_pbrs_distance_component', 'sum_pbrs_angle_component',
             ])
         self._rw_file.flush()
 
@@ -284,6 +321,7 @@ class Env(Node):
 
         angle_to_target = math.atan2(self.target_y - turtle_y, self.target_x - turtle_x) - yaw
         angle_to_target = math.atan2(math.sin(angle_to_target), math.cos(angle_to_target))
+        self.angle_to_target = angle_to_target   # PBRS: current-state (s_{t+1}) goal bearing
 
         distance_to_target = math.sqrt((self.target_x - turtle_x) ** 2 + (self.target_y - turtle_y) ** 2)
 
@@ -396,8 +434,12 @@ class Env(Node):
 
         # Reward-shaping per-episode reset
         self.prev_distance_to_target = self.initial_distance
+        # PBRS: seed Φ(s_0) angle from the reset state (get_state(0,0) above set it)
+        self.prev_angle_to_target = self.angle_to_target
         self._rc_terminal = self._rc_progress = self._rc_step = 0.0
         self._rc_turn = self._rc_near = self._rc_total = 0.0
+        self._rc_pbrs = self._rc_pbrs_phi_current = self._rc_pbrs_phi_next = 0.0
+        self._rc_pbrs_dist = self._rc_pbrs_angle = 0.0
 
         return state
 
@@ -635,6 +677,7 @@ class Env(Node):
         # ── Optional reward shaping (additive; default mode is a no-op) ──────
         terminal_component = reward  # 0 on normal steps, +100/-10 on terminal
         progress = step_pen = turn_pen = near_pen = 0.0
+        r_pbrs = phi_current = phi_next = pbrs_dist_c = pbrs_angle_c = 0.0
         if self.reward_mode == 'shaped':
             progress = self.reward_progress_scale * (self.prev_distance_to_target - distance)
             step_pen = -self.reward_step_penalty
@@ -644,7 +687,27 @@ class Env(Node):
                 near_pen = -self.reward_near_obstacle_scale * math.exp(
                     -d_min / self.reward_near_obstacle_sigma)
             reward += progress + step_pen + turn_pen + near_pen
+        elif self.reward_mode == 'pbrs':
+            # Potential-based shaping: F = pbrs_scale · (γ·Φ(s_{t+1}) − Φ(s_t)).
+            # prev_* describe s_t; `distance` / `self.angle_to_target` describe s_{t+1}
+            # (same relative goal distance/angle already in the observation).
+            prev_d, prev_a = self.prev_distance_to_target, self.prev_angle_to_target
+            curr_d, curr_a = distance, self.angle_to_target
+            # Guard: skip shaping this step (no crash) if any value is NaN/inf
+            if all(np.isfinite(v) for v in (curr_d, curr_a, prev_d, prev_a)):
+                phi_current = _pbrs_potential(prev_d, prev_a, self.pbrs_distance_weight,
+                                              self.pbrs_angle_weight, self.pbrs_distance_scale)
+                phi_next = _pbrs_potential(curr_d, curr_a, self.pbrs_distance_weight,
+                                           self.pbrs_angle_weight, self.pbrs_distance_scale)
+                r_pbrs = self.pbrs_scale * (self.pbrs_gamma * phi_next - phi_current)
+                if not np.isfinite(r_pbrs):
+                    r_pbrs = 0.0
+                reward += r_pbrs
+                # Diagnostic-only component split (summed into the reward CSV)
+                pbrs_dist_c = min(curr_d / self.pbrs_distance_scale, 1.0)
+                pbrs_angle_c = (1.0 - math.cos(curr_a)) / 2.0
         self.prev_distance_to_target = distance
+        self.prev_angle_to_target = self.angle_to_target
 
         self._rc_terminal += terminal_component
         self._rc_progress += progress
@@ -652,6 +715,11 @@ class Env(Node):
         self._rc_turn     += turn_pen
         self._rc_near     += near_pen
         self._rc_total    += reward
+        self._rc_pbrs             += r_pbrs
+        self._rc_pbrs_phi_current += phi_current
+        self._rc_pbrs_phi_next    += phi_next
+        self._rc_pbrs_dist        += pbrs_dist_c
+        self._rc_pbrs_angle       += pbrs_angle_c
 
         if done:
             outcome = ('success' if distance < REACH_TRESHOLD
@@ -666,6 +734,9 @@ class Env(Node):
                 round(self._rc_terminal, 4), round(self._rc_progress, 4),
                 round(self._rc_step, 4), round(self._rc_turn, 4),
                 round(self._rc_near, 4), round(self._rc_total, 4),
+                round(self._rc_pbrs, 4), round(self._rc_pbrs_phi_current, 4),
+                round(self._rc_pbrs_phi_next, 4), round(self._rc_pbrs_dist, 4),
+                round(self._rc_pbrs_angle, 4),
             ])
             self._rw_file.flush()
 
@@ -889,6 +960,8 @@ class Turtle(gym.Env):
                  reward_mode='default', reward_progress_scale=1.0,
                  reward_step_penalty=0.01, reward_turn_penalty=0.01,
                  reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
+                 pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
+                 pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super(Turtle, self).__init__()
         self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
@@ -896,6 +969,8 @@ class Turtle(gym.Env):
                         reward_mode, reward_progress_scale,
                         reward_step_penalty, reward_turn_penalty,
                         reward_near_obstacle_scale, reward_near_obstacle_sigma,
+                        pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
+                        pbrs_distance_scale, pbrs_gamma,
                         csv_dir, plots_dir)
 
         self.observation_space = spaces.Dict({

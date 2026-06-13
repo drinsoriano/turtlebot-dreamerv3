@@ -1683,6 +1683,24 @@ python3 dreamer.py --configs turtle --task turtle \\
         language="bash",
     )
     st.markdown(
+        "**PBRS reward** (potential-based, policy-invariant — `+100/−10` terminal "
+        "unchanged, plus `F = pbrs_scale·(γ·Φ(s′) − Φ(s))` from the relative goal "
+        "distance/angle; A\\* is **not** used). Defaults shown; all CLI-overridable. "
+        "Keep `--pbrs_gamma` equal to the agent discount (0.997). Logs the five "
+        "`sum_pbrs*` columns in `reward_*.csv`:"
+    )
+    st.code(
+        """cd ~/turtlebot-dreamerv3/dreamerv3-torch
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage1_360_none_seed0_reward_pbrs \\
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100 \\
+  --reward_mode pbrs \\
+  --pbrs_scale 1.0 --pbrs_distance_weight 1.0 --pbrs_angle_weight 0.2 \\
+  --pbrs_distance_scale 5.0 --pbrs_gamma 0.997""",
+        language="bash",
+    )
+    st.markdown(
         "**Odometry / IMU ablation** — swap `--odometry_mode` for `twist` / `delta` / "
         "`full` / `full_imu`. `full_imu` (7-dim: `full` + 2D `/imu` linear acceleration) "
         "needs no Gazebo change — `/imu` is already published. Use a **fresh logdir** "
@@ -1806,12 +1824,17 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
         ("--steps",                     "600000",      "total training steps (turtle default; 300k common)"),
         ("--eval_every",                "20000",       "eval interval in steps (single knob; lower = finer curve)"),
         ("--eval_episode_num",          "100",         "episodes per eval (2 = smoke; 100 = reporting)"),
-        ("--reward_mode",               "default",     "default (sparse) / shaped (additive shaping)"),
+        ("--reward_mode",               "default",     "default (sparse) / shaped (additive) / pbrs (potential-based, policy-invariant)"),
         ("--reward_progress_scale",     "1.0",         "shaped: +scale·(prev_dist − curr_dist)"),
         ("--reward_step_penalty",       "0.01",        "shaped: −c per step"),
         ("--reward_turn_penalty",       "0.01",        "shaped: −k·|ang_vel_cmd|"),
         ("--reward_near_obstacle_scale","0.1",         "shaped: near-obstacle penalty scale"),
         ("--reward_near_obstacle_sigma","0.25",        "shaped: near-obstacle penalty σ"),
+        ("--pbrs_scale",                "1.0",         "pbrs: overall weight on F = pbrs_scale·(γ·Φ(s′) − Φ(s))"),
+        ("--pbrs_distance_weight",      "1.0",         "pbrs: weight of distance term in Φ"),
+        ("--pbrs_angle_weight",         "0.2",         "pbrs: weight of heading-alignment term in Φ"),
+        ("--pbrs_distance_scale",       "5.0",         "pbrs: distance normaliser (m); fixed, not stage-aware"),
+        ("--pbrs_gamma",                "0.997",       "pbrs: discount; keep == agent discount (0.997) for policy invariance"),
         ("--prefill",                   "500",         "random steps before training (once)"),
         ("--time_limit",                "250",         "max steps per episode before timeout"),
         ("--resource_logging",          "true",        "CPU/RAM/GPU logging (False to disable)"),
