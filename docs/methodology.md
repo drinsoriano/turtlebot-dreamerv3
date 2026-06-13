@@ -294,7 +294,7 @@ The training procedure proceeds as follows:
    | Condition | Test | Reward (default mode) | Outcome label |
    |---|---|---|---|
    | Success | distance to goal below the acceptance radius of 0.4 metres | plus 100 | `success` |
-   | Collision | minimum LiDAR range below the collision threshold of 0.2 metres | minus 10 | `collision` |
+   | Collision | minimum LiDAR range below the collision threshold of 0.13 metres (just above the 0.12 m LiDAR floor; near-contact) | minus 10 | `collision` |
    | Timeout | step counter reaches the per-episode step limit | minus 10 | `timeout` |
    | Non-terminal | none of the above | 0 | none |
 
@@ -310,7 +310,7 @@ The training procedure proceeds as follows:
    | Progress | scale times prev distance minus current distance | `reward_progress_scale` equal to 1.0 |
    | Step penalty | minus step penalty | `reward_step_penalty` equal to 0.01 |
    | Turn penalty | minus turn penalty times absolute angular action | `reward_turn_penalty` equal to 0.01 |
-   | Near-obstacle | minus scale times exp of minus d_min over sigma when d_min below 0.3 metres | `reward_near_obstacle_scale` equal to 0.1, `reward_near_obstacle_sigma` equal to 0.25 |
+   | Near-obstacle | minus scale times exp of minus d_min over sigma when d_min below 0.2 metres | `reward_near_obstacle_scale` equal to 0.1, `reward_near_obstacle_sigma` equal to 0.25 |
 
    In `default` mode these terms are all zero, so the reward is exactly the original
    sparse signal.

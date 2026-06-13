@@ -133,6 +133,20 @@ Numeric fields are **blank (empty string)** for non-`ok` rows — never `-1.0` �
 
 **Do not change** in this branch: observation space, odometry modes, DreamerV3 architecture, A* metric computation, dashboard, resource logging, torch/CUDA setup.
 
+### Collision detection thresholds
+
+Two LiDAR-distance thresholds in [envs/turtle.py](dreamerv3-torch/envs/turtle.py) define the danger bands (min LiDAR reading = sensor≈robot-centre → obstacle surface):
+
+| Band | Distance (centre→obstacle) | Effect |
+|---|---|---|
+| **Collision** | `< 0.13 m` (`COLISION_TRESHOLD`, l.26) | Terminate episode, `reward = −10`, `outcome=collision` |
+| **Near-miss / RS-4 active** | `0.13 – 0.2 m` (`near_collision_threshold`, l.142) | `near_collisions` counter **and** RS-4 reward gate (shaped mode); **no** termination |
+| Safe | `≥ 0.2 m` | — |
+
+- **Why 0.13 m:** the LiDAR hardware **min range is 0.120 m** (`model.sdf`), so any threshold ≤ 0.12 m can never fire (collision would silently break). 0.13 m is the tightest reliable value — ~0.025 m from the robot's 0.105 m physical edge ≈ near-contact.
+- **`near_collision_threshold` is one variable, two uses** — it gates the diagnostic counter (l.331) **and** the RS-4 penalty (l.639); changing it moves both.
+- **Changed 2026-06-13** (was collision `0.2 m`, near-collision `0.3 m`). **Methodology: keep one collision/near-collision threshold across all runs in a comparison** — like RTF, do not mix `0.2/0.3 m` and `0.13/0.2 m` runs (it changes the MDP termination + reward).
+
 ### Reward mode (implemented)
 
 Shaping is **opt-in** via `--reward_mode`. The original reward is preserved exactly:
@@ -149,7 +163,9 @@ Shaped reward `= reward_default + progress + step_pen + turn_pen + near_obst`:
 | RS-1 | Progress reward | `+scale * (prev_dist − curr_dist)` | `reward_progress_scale` (1.0) |
 | RS-2 | Step penalty | `−c` per step | `reward_step_penalty` (0.01) |
 | RS-3 | Turning penalty | `−k * |ang_vel_cmd|` | `reward_turn_penalty` (0.01) |
-| RS-4 | Near-obstacle penalty | `−k * exp(−d_min / σ)` when `d_min < 0.3 m` | `reward_near_obstacle_scale` (0.1), `reward_near_obstacle_sigma` (0.25) |
+| RS-4 | Near-obstacle penalty | `−k * exp(−d_min / σ)` when `d_min < 0.2 m` | `reward_near_obstacle_scale` (0.1), `reward_near_obstacle_sigma` (0.25) |
+
+> **RS-4 gate = `near_collision_threshold`.** The `d_min < 0.2 m` activation is **not** a separate constant — RS-4 reads the same `near_collision_threshold` that gates the diagnostic `near_collisions` counter (one variable, two uses). It was tightened 0.3 → 0.2 m alongside the collision threshold (see [Collision detection](#collision-detection-thresholds) below); changing one moves both.
 
 Weights are kept **mild by default** — progress is deliberately weak so complex stages can still take temporary detours around obstacles. All knobs are CLI-overridable.
 

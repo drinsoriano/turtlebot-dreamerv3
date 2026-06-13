@@ -91,7 +91,7 @@ of three mutually exclusive conditions:
 | Condition | Test | Reward (default mode) | Outcome label |
 |---|---|---|---|
 | **Success** | distance to goal below the acceptance radius (0.4 m) | `+100` | `success` |
-| **Collision** | minimum LiDAR range below the collision threshold (0.2 m) | `-10` | `collision` |
+| **Collision** | minimum LiDAR range below the collision threshold (0.13 m; just above the 0.12 m LiDAR floor, near-contact) | `-10` | `collision` |
 | **Timeout** | step counter reaches the per-episode step limit | `-10` | `timeout` |
 | Non-terminal step | none of the above | `0` | — |
 
@@ -103,7 +103,7 @@ unchanged and **adds** four per-step terms:
 | Progress | `scale * (prev_distance - curr_distance)` | `reward_progress_scale = 1.0` |
 | Step penalty | `- step_penalty` | `reward_step_penalty = 0.01` |
 | Turn penalty | `- turn_penalty * abs(angular_action)` | `reward_turn_penalty = 0.01` |
-| Near-obstacle penalty | `- scale * exp(-d_min / sigma)` when `d_min` below 0.3 m | `reward_near_obstacle_scale = 0.1`, `reward_near_obstacle_sigma = 0.25` |
+| Near-obstacle penalty | `- scale * exp(-d_min / sigma)` when `d_min` below 0.2 m | `reward_near_obstacle_scale = 0.1`, `reward_near_obstacle_sigma = 0.25` |
 
 In `default` mode these terms are all zero, so the reward is exactly the original
 sparse signal.

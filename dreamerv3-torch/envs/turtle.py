@@ -23,7 +23,9 @@ from gym import spaces
 
 REACH_TRESHOLD = 0.4
 LIDAR_MAX_RANGE = 3.5
-COLISION_TRESHOLD = 0.2
+COLISION_TRESHOLD = 0.13   # m — min LiDAR (sensor≈centre) to obstacle. Just above the
+                           # 0.12 m LiDAR hardware floor (model.sdf); ~0.025 m from the
+                           # robot's 0.105 m edge ≈ near-contact. (was 0.2 m)
 EASE_DECAY = 0.005
 EASE_BEGIN = 0.75
 EASE_MIN = 0.01
@@ -137,7 +139,9 @@ class Env(Node):
         self.initial_distance = 0.0
         self.min_obstacle_dist = float('inf')
         self.near_collision_count = 0
-        self.near_collision_threshold = 0.3
+        self.near_collision_threshold = 0.2   # m — was 0.3. Gates BOTH the near_collisions
+                                              # counter (l.331) and the RS-4 reward penalty
+                                              # gate (l.639); one variable drives both.
         self.episode_number = 0
         self._mode = mode
         self._run_name = run_name

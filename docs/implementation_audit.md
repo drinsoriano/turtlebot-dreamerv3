@@ -201,7 +201,7 @@ Computed in `get_reward_and_done` (`turtle.py` l.533–638).
 | Event | Condition | Reward |
 |---|---|---|
 | Success | `distance < REACH_TRESHOLD` (`0.4 m`, l.24) | `+100` (l.542) |
-| Collision | `min(lidar) < COLISION_TRESHOLD` (`0.2 m`, l.26) | `-10` (l.564) |
+| Collision | `min(lidar) < COLISION_TRESHOLD` (`0.13 m`, l.26) | `-10` (l.564) |
 | Timeout | `step_counter >= max_steps - 1` | `-10` (l.586) |
 | Otherwise | — | `0` |
 
@@ -214,7 +214,7 @@ unchanged terminal reward (l.604–616), gated by `if self.reward_mode == 'shape
 | Progress | `scale * (prev_distance - distance)` | `reward_progress_scale=1.0` |
 | Step penalty | `- reward_step_penalty` | `0.01` |
 | Turn penalty | `- reward_turn_penalty * abs(ang_vel_cmd)` | `0.01` |
-| Near-obstacle | `- scale * exp(-d_min/sigma)` when `d_min < 0.3 m` | `scale=0.1`, `sigma=0.25` |
+| Near-obstacle | `- scale * exp(-d_min/sigma)` when `d_min < 0.2 m` | `scale=0.1`, `sigma=0.25` |
 
 **Other reward modes:**
 - Traffic shaping — **not found in the current implementation**.
@@ -233,7 +233,7 @@ Per-episode reward-component sums are written to a reward CSV in both modes
 `get_reward_and_done` (`turtle.py`):
 
 - **Success** — goal within `REACH_TRESHOLD = 0.4 m` (l.539).
-- **Collision** — `np.min(lidar) < COLISION_TRESHOLD = 0.2 m` (l.561).
+- **Collision** — `np.min(lidar) < COLISION_TRESHOLD = 0.13 m` (l.561).
 - **Timeout** — `step_counter >= max_steps - 1` (l.583).
 
 **Episode horizon is config-driven** (**implemented**): `max_steps` is the
@@ -281,7 +281,7 @@ Metrics actually computed/logged:
 | Path directness (`initial_distance / actual_path_length`, capped 1.0) | yes | black-box (l.410) |
 | A* path efficiency (`planned / actual`, region + centre) | yes | planning CSV (`_write_planning_csv` l.471) |
 | Minimum obstacle distance | yes | black-box (`min_obstacle_dist`) |
-| Near-collision count (steps with `min lidar < 0.3 m`) | yes | black-box (l.308–309) |
+| Near-collision count (steps with `min lidar < 0.2 m`) | yes | black-box (l.308–309) |
 | Episode return (train & eval) | yes | white-box CSV via `Logger` (`tools.py` l.287, 318) |
 | Reward variance | yes | white-box (`tools.py` l.291–294) |
 | Model / actor / value losses, KL, prior/posterior entropy | yes | white-box (`tools.py` l.87–91) |
