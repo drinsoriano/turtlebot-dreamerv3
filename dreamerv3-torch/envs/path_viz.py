@@ -6,7 +6,8 @@ Generates a 2-D overhead plot per episode showing:
   - A* reference path (blue) with endpoint marker
   - Goal acceptance circle (dashed red, radius = REACH_THRESHOLD)
   - Actual robot trajectory (orange)
-  - Start (green circle) and goal (red star)
+  - TurtleBot3 Burger markers at the start and final trajectory poses (to-scale, with heading)
+  - Goal (red star)
 
 Saved to: {plots_dir}/{run_name}/ep{episode:05d}_{outcome}.png
 
@@ -27,6 +28,7 @@ from matplotlib.transforms import Affine2D
 from envs.stage_map import STAGE_ARENAS, STAGE_OBSTACLES
 
 REACH_THRESHOLD = 0.4  # metres — must match turtle.py REACH_TRESHOLD
+ROBOT_RADIUS = 0.105   # metres — physical TurtleBot3 Burger footprint (see CLAUDE.md)
 
 
 def _path_len(pts: list[tuple[float, float]]) -> float:
@@ -71,6 +73,69 @@ def _draw_stage(ax, stage: int) -> None:
             transform = Affine2D().rotate_deg(theta_deg).translate(cx, cy) + ax.transData
             rect.set_transform(transform)
             ax.add_patch(rect)
+
+
+def _heading_at(traj: list[tuple[float, float]], end: bool) -> float:
+    """Heading (rad) from the first (end=False) or last (end=True) non-trivial segment.
+
+    Scans outward for the first point >2 cm from the start/endpoint so start/stop
+    jitter doesn't yield a random arrow direction. Returns 0.0 if undefined.
+    """
+    if len(traj) < 2:
+        return 0.0
+    if end:
+        ex, ey = traj[-1]
+        for i in range(len(traj) - 2, -1, -1):
+            dx, dy = ex - traj[i][0], ey - traj[i][1]
+            if math.hypot(dx, dy) > 0.02:
+                return math.atan2(dy, dx)
+    else:
+        sx, sy = traj[0]
+        for i in range(1, len(traj)):
+            dx, dy = traj[i][0] - sx, traj[i][1] - sy
+            if math.hypot(dx, dy) > 0.02:
+                return math.atan2(dy, dx)
+    return 0.0
+
+
+def _draw_robot(ax, x: float, y: float, heading: float,
+                body_color: str, label: str) -> None:
+    """Top-down TurtleBot3 Burger marker (body + wheels + heading arrow) at (x, y).
+
+    Visualization only — drawn at the robot's actual 0.105 m footprint so it is
+    to-scale with obstacles and the goal region. Sits on top (high zorder).
+    """
+    cos_h, sin_h = math.cos(heading), math.sin(heading)
+    lx, ly = -sin_h, cos_h   # left/lateral unit vector
+
+    # Body — circular footprint (labelled so it appears once in the legend)
+    ax.add_patch(mpatches.Circle(
+        (x, y), ROBOT_RADIUS,
+        linewidth=1.2, edgecolor='black', facecolor=body_color, alpha=0.9,
+        zorder=8, label=label,
+    ))
+
+    # Two side wheels — rotated rectangles aligned with heading
+    wheel_sep, wheel_len, wheel_wid = 0.16, 0.05, 0.02
+    for side in (+1, -1):
+        wcx = x + side * (wheel_sep / 2) * lx
+        wcy = y + side * (wheel_sep / 2) * ly
+        wheel = mpatches.Rectangle(
+            (-wheel_len / 2, -wheel_wid / 2), wheel_len, wheel_wid,
+            linewidth=0, facecolor='black', zorder=9, label='_nolegend_',
+        )
+        wheel.set_transform(
+            Affine2D().rotate(heading).translate(wcx, wcy) + ax.transData)
+        ax.add_patch(wheel)
+
+    # Heading arrow — front indicator (yellow, on top)
+    arrow_len = ROBOT_RADIUS * 1.7
+    ax.annotate(
+        '', xytext=(x, y),
+        xy=(x + arrow_len * cos_h, y + arrow_len * sin_h),
+        arrowprops=dict(arrowstyle='-|>', color='#ffcc00', lw=1.8),
+        zorder=10, annotation_clip=False,
+    )
 
 
 def save_episode_plot(
@@ -156,11 +221,19 @@ def save_episode_plot(
         ax.plot(rx, ry, color='#ff7f0e', linewidth=2.0, zorder=4,
                 label=f'Trajectory — {traj_len:.2f} m')
 
-    # Start and goal markers (drawn on top)
-    ax.plot(start[0], start[1], 'o', color='#2ca02c', markersize=10,
-            zorder=6, label='Start')
+    # Goal marker (drawn on top)
     ax.plot(goal[0], goal[1], '*', color='#d62728', markersize=14,
             zorder=6, label='Goal center')
+
+    # TurtleBot3 Burger markers at the start and final poses (visualization only)
+    _draw_robot(ax, start[0], start[1],
+                _heading_at(list(robot_traj), end=False),
+                body_color='#2ca02c', label='Robot (start)')
+    if robot_traj:
+        rxe, rye = robot_traj[-1]
+        _draw_robot(ax, rxe, rye,
+                    _heading_at(list(robot_traj), end=True),
+                    body_color='#33373b', label='Robot (final pose)')
 
     # Title
     ts_str = f'\n{timestamp}' if timestamp else ''
