@@ -4,7 +4,8 @@ Gabay (sa Tagalog) kung paano gamitin ang Bayesian Optimization (BO / Optuna)
 para sa reward shaping, at paano i-validate ang panalong weights sa stages 1–8.
 Isinulat ito para maiwasan ang ilang karaniwang pagkakamali sa interpretasyon.
 Para sa teknikal na detalye sa Ingles, tingnan ang
-[methodology.md](methodology.md) at ang CLAUDE.md (seksyon **Reward-Weight
+[reward_tuning_workflow.md](reward_tuning_workflow.md) (English companion),
+[methodology.md](methodology.md), at ang CLAUDE.md (seksyon **Reward-Weight
 Tuning (Bayesian Optimization)**).
 
 > **Pinakamahalagang punto:** Ang **reward weights** (5 `--reward_*` numbers) ay
@@ -34,8 +35,11 @@ Isang **set** ng 5 numbers na ito ang tinatawag na "config" o "weights."
 
 ### Phase 1 — BO Search (tuning)
 - `tune_reward.py` ay nagpapatakbo ng **30 trials** (default).
-- **Bawat trial = ISANG candidate set ng 5 weights**, sinasanay sa **maikling
-  budget** (`--steps 40000`, 1 seed lang).
+- **Bawat trial = ISANG candidate set ng 5 weights**, sinasanay sa **proxy
+  budget** (`--steps ≥80000`, ginagamit dito ang `100000`, 1 seed lang).
+  *(Dating 40000 — pero sa 40k, ang `SCORE_WINDOW=60` ay aabot sa untrained `ctr=0`
+  eval at madudumihan ang score; kaya gamitin ang ≥80k. Tingnan ang
+  [evaluation_loop.md](evaluation_loop.md).)*
 - I-si-score ang bawat trial gamit ang eval `planner_path_efficiency`, na may
   **constraint**: ang success rate ay hindi dapat bumagsak nang higit sa `margin`
   (default 5 puntos) mula sa baseline.
@@ -101,22 +105,25 @@ Kung bagong logdir ang stage 2, **from scratch** talaga — walang cross-stage
 Pumipili ang BO ng best **feasible** trial (pinakamataas na efficiency, basta
 hindi bumagsak ang success nang higit sa margin).
 
-**Opsyon A — `export_tune_results.py` (CSV sa `csv_logs/tune_stage{N}/`):**
+> **Naka-namespace sa odometry mode ang study/db/csv** (suffix `_{mode}`, kasama ang
+> `_none`). Halimbawa sa baba ay `full_imu`; palitan ang mode ayon sa tinune mo.
+
+**Opsyon A — `export_tune_results.py` (CSV sa `csv_logs/tune_stage{N}_{mode}/`):**
 ```bash
 cd ~/turtlebot-dreamerv3/dreamerv3-torch
-python3 export_tune_results.py --stage 1
+python3 export_tune_results.py --stage 4 --odometry-mode full_imu
 ```
 Sumusulat ng:
-- `csv_logs/tune_stage1/tune_trials_stage1.csv` — **lahat** ng trials (best at
+- `csv_logs/tune_stage4_full_imu/tune_trials_stage4.csv` — **lahat** ng trials (best at
   hindi best) + 5 weights kada isa.
-- `csv_logs/tune_stage1/tune_best_stage1.csv` — ang **best feasible** lang (1 row).
+- `csv_logs/tune_stage4_full_imu/tune_best_stage4.csv` — ang **best feasible** lang (1 row).
 
 **Opsyon B — direktang basahin ang study DB:**
 ```bash
 python3 - <<'PY'
 import optuna
-s = optuna.load_study(study_name="reward_stage1",
-                      storage="sqlite:///tune_reward_stage1.db")
+s = optuna.load_study(study_name="reward_stage4_full_imu",
+                      storage="sqlite:///tune_reward_stage4_full_imu.db")
 done = [t for t in s.trials if t.value is not None]
 feas = [t for t in done if t.user_attrs.get("constraint",(1.0,))[0] <= 0]
 best = max(feas or done, key=lambda t: t.value)
@@ -133,14 +140,15 @@ PY
 
 ## Validation command (full budget)
 
-Ipasok ang **iisang** best 5 weights. Para sa **stage 1**, ulitin sa seed `0,1,2`;
-para sa **transfer**, palitan ang `--stage` at `--logdir` (2, 3, 4) — **parehong
-5 weights**:
+Ipasok ang **iisang** best 5 weights, at gamitin ang **parehong `--odometry_mode`**
+na tinune mo (hal. `full_imu` — hindi `none` kung `full_imu` ang BO study). Ulitin sa
+seed `0,1,2`; para sa **transfer**, palitan ang `--stage` at `--logdir` (2, 3, 4) —
+**parehong 5 weights at parehong mode**:
 
 ```bash
 python3 dreamer.py --configs turtle --task turtle \
-  --logdir ./logdir/stage1_360_none_seed0_reward_tuned \
-  --stage 1 --lidar 360 --odometry_mode none --seed 0 \
+  --logdir ./logdir/stage4_360_full_imu_seed0_reward_tuned \
+  --stage 4 --lidar 360 --odometry_mode full_imu --seed 0 \
   --device cuda --steps 300000 --eval_episode_num 100 \
   --reward_mode shaped \
   --reward_progress_scale <v> --reward_step_penalty <v> --reward_turn_penalty <v> \
