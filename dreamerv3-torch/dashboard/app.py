@@ -1583,11 +1583,42 @@ def _section_commands():
         "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py gui:=false",
         language="bash",
     )
+    st.code(
+        "# verify Gazebo is ready\n"
+        "ros2 service list | grep reset\n"
+        "ros2 topic list | grep -E \"/odom|/scan|/cmd_vel|/imu\"",
+        language="bash",
+    )
     st.caption(
-        "Verify ready:  `ros2 service list | grep reset`  and  "
-        "`ros2 topic list | grep -E \"/odom|/scan|/cmd_vel|/imu\"`  "
-        "(`/imu` only needed for `odometry_mode=full_imu`). "
-        "If a separate terminal sees no topics, `export ROS_LOCALHOST_ONLY=1` to match the launch."
+        "Expect `/reset_simulation` from the service check and all four topics from the topic check. "
+        "`/imu` is only needed for `odometry_mode=full_imu`. "
+        "If a separate terminal sees no topics, run `export ROS_LOCALHOST_ONLY=1` to match the launch env."
+    )
+    st.markdown(
+        "**Prove the program is subscribed to the ROS2 topics (panel demo).** "
+        "Needs Gazebo up **and** a live `dreamer.py` run (the node `trainer_node` only "
+        "exists while training/eval is running). One headline command shows the whole wiring:"
+    )
+    st.code(
+        "# all subscriptions + publishers of our program in one view\n"
+        "ros2 node info /trainer_node",
+        language="bash",
+    )
+    st.code(
+        "# per-topic proof — --verbose prints the node name of each endpoint\n"
+        "ros2 topic info /scan    --verbose   # subscriber = trainer_node\n"
+        "ros2 topic info /odom    --verbose   # subscriber = trainer_node\n"
+        "ros2 topic info /imu     --verbose   # subscriber = trainer_node (full_imu run only)\n"
+        "ros2 topic info /cmd_vel --verbose   # trainer_node = PUBLISHER here (action out)",
+        language="bash",
+    )
+    st.caption(
+        "`trainer_node` **subscribes** to the 3 sensors — `/scan` (LiDAR), `/odom` (odometry), "
+        "`/imu` (IMU) — and **publishes** the velocity command to `/cmd_vel` (the action). "
+        "`/cmd_vel` is *published, not subscribed* — frame it as the sense→act loop. "
+        "`/imu` appears under Subscribers **only** when an `--odometry_mode full_imu` run is live; "
+        "`none/twist/delta/full` show just `/scan` + `/odom` (IMU sub is `full_imu`-only by design). "
+        "`trainer_node` appears twice (train env + eval env), so each subscribed topic shows count 2."
     )
     st.warning(
         "**Headless on the eGPU.** `gzclient` (the GUI) renders via OpenGL on the GPU; on the "
@@ -1728,6 +1759,38 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
 # then plug the printed --reward_* weights into the 'tuned' full run in section 2,
 # repeat for seeds 0,1,2 on stage 1, then stages 2–4 for the transfer test.""",
         language="bash",
+    )
+
+    # ── 5. Monitoring tools ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("5 · Monitoring tools")
+    st.markdown("**Dashboard** — run this Streamlit app:")
+    st.code(
+        "cd ~/turtlebot-dreamerv3/dreamerv3-torch\n"
+        "streamlit run dashboard/app.py",
+        language="bash",
+    )
+    st.markdown("**GPU monitor — `nvtop`** (per-process GPU/CPU/mem, live):")
+    st.code("nvtop", language="bash")
+    st.caption(
+        "`nvtop` shows every GPU process with live utilisation, memory, and power. "
+        "Install with: `sudo apt install nvtop`"
+    )
+    st.markdown("**GPU snapshot — `nvidia-smi`** (one-shot or watch mode):")
+    st.code(
+        "# one-shot snapshot\n"
+        "nvidia-smi\n\n"
+        "# live — refresh every 1 second\n"
+        "watch -n 1 nvidia-smi\n\n"
+        "# compact per-process table\n"
+        "nvidia-smi pmon -s um -d 2",
+        language="bash",
+    )
+    st.caption(
+        "`nvidia-smi` reports device-wide GPU utilisation, memory, power, and temperature. "
+        "`pmon` (`-s um` = utilisation + memory, `-d 2` = 2 s interval) shows a live "
+        "per-process breakdown — useful for confirming that only DreamerV3 is on CUDA "
+        "(Gazebo's `gzserver`/`gzclient` use OpenGL and do NOT appear in CUDA pmon)."
     )
 
     # ── Parameter reference ───────────────────────────────────────────────────

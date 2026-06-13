@@ -86,6 +86,7 @@ def save_episode_plot(
     astar_center_waypoints: list[tuple[float, float]] | None = None,
     efficiency_center: float | str = '',
     plots_dir: str = './path_plots',
+    timestamp: str = '',
 ) -> None:
     """Save top-down path comparison plot to {plots_dir}/{run_name}/."""
     out_dir = os.path.join(plots_dir, run_name)
@@ -162,11 +163,10 @@ def save_episode_plot(
             zorder=6, label='Goal center')
 
     # Title
-    eff_str = f'  eff_region={efficiency:.3f}' if isinstance(efficiency, float) else ''
-    cen_str = f'  eff_centre={efficiency_center:.3f}' if isinstance(efficiency_center, float) else ''
+    ts_str = f'\n{timestamp}' if timestamp else ''
     ax.set_title(
-        f'Episode {episode}  —  {outcome}{eff_str}{cen_str}{ep_dist_str}\n'
-        f'Stage {stage}  |  {run_name}',
+        f'Episode {episode}  —  {outcome}\n'
+        f'Stage {stage}  |  {run_name}{ts_str}',
         fontsize=10,
     )
     ax.set_xlabel('x (m)')

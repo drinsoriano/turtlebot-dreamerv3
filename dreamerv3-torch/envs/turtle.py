@@ -518,8 +518,9 @@ class Env(Node):
         else:
             cen_raw = cen_capped = cen_out = ''
 
+        dt_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self._pl_writer.writerow([
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            dt_str,
             self.stage,
             self.episode_number,
             outcome,
@@ -551,6 +552,7 @@ class Env(Node):
                     efficiency=reg_capped if reg_status == 'ok' else '',
                     efficiency_center=cen_capped if cen_status == 'ok' else '',
                     plots_dir=self._plots_dir,
+                    timestamp=dt_str,
                 )
             except Exception:
                 pass
