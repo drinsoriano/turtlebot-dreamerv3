@@ -283,7 +283,9 @@ def main(config):
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
 
-    # make sure eval will be executed once after config.steps
+    # Loop bound is steps + eval_every so the model AT config.steps gets evaluated
+    # (eval runs at the top of each iteration); the break below then stops before
+    # training a wasted post-final-eval chunk (saves ~eval_every steps per run).
     ctr = -1
     best_eval = -np.inf
     while agent._step < config.steps + config.eval_every:
@@ -311,7 +313,10 @@ def main(config):
                 torch.save(items_to_save, logdir / "best.pt")
                 data = pd.DataFrame({'scores': eval_ret})
                 data.to_csv(f'./{logdir}/best.csv')
-        
+
+        if agent._step >= config.steps:   # final-budget eval done above — don't train a wasted tail
+            break
+
         print("Start training.")
         state = tools.simulate(
             agent,
