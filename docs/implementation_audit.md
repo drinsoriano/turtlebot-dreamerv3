@@ -75,7 +75,7 @@ python3 dreamer.py --configs turtle --task turtle \
   --logdir ./logdir/<run_name> \
   --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full|full_imu> \
   --seed <S> --device <cpu|cuda> [--steps <int>] [--eval_episode_num <int>] \
-  [--reward_mode <default|shaped>] [--reward_* <float> ...]
+  [--reward_mode <default|shaped|pbrs>] [--reward_* <float> ...] [--pbrs_* <float> ...]
 ```
 
 Evidence: `if __name__ == "__main__"` block (`dreamer.py` l.325–349) merges the
@@ -216,14 +216,36 @@ unchanged terminal reward (l.604–616), gated by `if self.reward_mode == 'shape
 | Turn penalty | `- reward_turn_penalty * abs(ang_vel_cmd)` | `0.01` |
 | Near-obstacle | `- scale * exp(-d_min/sigma)` when `d_min < 0.2 m` | `scale=0.1`, `sigma=0.25` |
 
+**PBRS reward (`reward_mode='pbrs'`) — implemented.** A single potential-based
+shaping term added on top of the unchanged terminal reward, gated by
+`elif self.reward_mode == 'pbrs'` (`turtle.py` l.690). It is **policy-invariant**
+(Ng, Harada & Russell, 1999): `r_pbrs = pbrs_scale · (pbrs_gamma · Φ(s') − Φ(s))`
+with `Φ(s) = −(pbrs_distance_weight·d_norm + pbrs_angle_weight·a_norm)`, where
+`d_norm = min(distance/pbrs_distance_scale, 1)` and `a_norm = (1−cos angle)/2` use
+the **relative goal distance/angle already in the observation** (never the raw pose,
+never A*). `default`/`shaped` are unchanged; PBRS does **not** also apply RS-1…RS-4.
+
+| Knob | Default | Role |
+|---|---|---|
+| `pbrs_scale` | 1.0 | overall weight |
+| `pbrs_distance_weight` | 1.0 | distance term of `Φ` |
+| `pbrs_angle_weight` | 0.2 | heading-alignment term of `Φ` |
+| `pbrs_distance_scale` | 5.0 | distance normaliser (m), fixed (not stage-aware) |
+| `pbrs_gamma` | 0.997 | PBRS discount; equals the agent `discount` for invariance |
+
+**Scope note (not an architecture change).** All three reward modes differ **only**
+inside `get_reward_and_done()`; the world model, actor/critic, observation space,
+and action space are unchanged (`models.py`/`networks.py` untouched). PBRS adds no
+network, layer, parameter, or observation key — only the scalar reward changes.
+
 **Other reward modes:**
 - Traffic shaping — **not found in the current implementation**.
 - A*/planner-guided reward — **not found in the current implementation** (A* is
-  used only as a logged metric; see §12). The only branch on `reward_mode` is for
-  `'shaped'`; `default` is a no-op shaping path.
+  used only as a logged metric; see §12). `reward_mode` branches on `'shaped'` and
+  `'pbrs'`; `default` is a no-op shaping path.
 
-Per-episode reward-component sums are written to a reward CSV in both modes
-(l.629–636).
+Per-episode reward-component sums are written to a reward CSV in all modes
+(`turtle.py` l.731–739), including five appended `sum_pbrs*` columns.
 
 ---
 
@@ -377,7 +399,9 @@ Features confirmed implemented and safe to include in a methodology:
 3. **Dictionary observation space** — `sensor_readings`, `target`, `velocity`
    (+ optional `odometry`), tanh-normalised.
 4. **2-D continuous action** mapped to bounded linear/angular velocity.
-5. **Sparse default reward** plus an **opt-in additive shaped reward**.
+5. **Sparse default reward** plus two opt-in shaping modes — an **additive `shaped`
+   reward** and a **potential-based `pbrs` reward** (policy-invariant; reward-only,
+   not an architecture change).
 6. **Three terminal conditions** (success/collision/timeout) with a config-driven
    step horizon.
 7. **Odometry ablation modes** (`none/twist/delta/full/full_imu`).
@@ -419,7 +443,8 @@ Features confirmed implemented and safe to include in a methodology:
   (encoder is MLP-only; the `image` key is an unused placeholder).
 - **A*/planner-guided reward (RS-P)** — **not found in the current
   implementation** (A* is metric-only).
-- **Traffic or other reward modes** — **not found** (only `default` and `shaped`).
+- **Traffic or other reward modes** — **not found** (the implemented modes are
+  `default`, `shaped`, and `pbrs`).
 - **Exploration behaviors** — `Random` and `Plan2Explore` exist (`exploration.py`)
   but the configured `expl_behavior` is `greedy`, so they are **not active by
   default** (**inferred from implementation**). Confirm whether any non-greedy

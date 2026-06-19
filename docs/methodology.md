@@ -37,8 +37,11 @@ the core agent, observation space, and action space remain unchanged:
 - **Arena complexity** — eight progressively harder stages (1 to 8) selectable
   with a `--stage` argument (**implemented**; stages 1 to 8 supported after the
   2026-06-09 goal-sampler extension).
-- **Reward condition** — a sparse `default` reward or an additive `shaped` reward
-  (**implemented**).
+- **Reward condition** — one of three modes: a sparse `default` reward, an additive
+  `shaped` reward, or a potential-based `pbrs` reward (**implemented**). All three
+  keep the terminal reward unchanged and differ only in the per-step shaping added
+  inside the environment; `pbrs` is *policy-invariant* (it does not alter the optimal
+  policy, only learning dynamics).
 - **Observation condition (odometry ablation)** — five observation variants
   `none`, `twist`, `delta`, `full`, `full_imu` (**implemented**; `full_imu` adds
   2-D linear acceleration from `/imu` on top of `full`).
@@ -257,7 +260,7 @@ python3 dreamer.py --configs turtle --task turtle \
   --logdir ./logdir/<run_name> \
   --stage <N> --lidar <360|10> --odometry_mode <none|twist|delta|full|full_imu> \
   --seed <S> --device <cpu|cuda> [--steps <int>] [--eval_episode_num <int>] \
-  [--reward_mode <default|shaped>] [--reward_* <float> ...]
+  [--reward_mode <default|shaped|pbrs>] [--reward_* <float> ...] [--pbrs_* <float> ...]
 ```
 
 The training procedure proceeds as follows:
@@ -321,6 +324,18 @@ The training procedure proceeds as follows:
 
    In `default` mode these terms are all zero, so the reward is exactly the original
    sparse signal.
+
+   **Potential-based reward shaping** (`reward_mode` equal to `pbrs`) instead adds a
+   single term `pbrs_scale times (pbrs_gamma times Phi of next state minus Phi of
+   current state)`, with potential `Phi(s) = minus (pbrs_distance_weight times d_norm
+   plus pbrs_angle_weight times a_norm)` computed from the relative goal distance and
+   angle already in the observation. With `pbrs_gamma` equal to the agent discount
+   (0.997) this is **policy-invariant** (Ng, Harada and Russell, 1999): it changes the
+   learning dynamics but provably not the optimal policy, unlike the additive `shaped`
+   terms. It does not use A* and does not also apply the four `shaped` terms. Defaults:
+   `pbrs_scale` 1.0, `pbrs_distance_weight` 1.0, `pbrs_angle_weight` 0.2,
+   `pbrs_distance_scale` 5.0, `pbrs_gamma` 0.997. See
+   [reward_shaping.md](reward_shaping.md) for the data-flow diagram and full treatment.
 7. **Model update.** Each update has a world-model part (encoder, RSSM, and heads
    trained on a replay batch) and an actor-critic part (imagined rollouts, critic
    regression to lambda-returns, and actor improvement).
@@ -360,7 +375,7 @@ fixed.
 | Variable Type | Variable or Component | Operational Definition | Evidence from Audit or Code | Role in the Study |
 |---|---|---|---|---|
 | Independent | Arena stage | Stage number 1 to 8 selecting arena size and obstacle layout. | `--stage`; `STAGE_ARENAS` and `_sample_target_position` (stages 1 to 8). | Manipulated difficulty condition. |
-| Independent | Reward mode | `default` sparse reward or `shaped` additive reward. | `reward_mode` in `configs.yaml`; branch in `get_reward_and_done`. | Reward intervention condition. |
+| Independent | Reward mode | `default` sparse reward, `shaped` additive reward, or `pbrs` potential-based reward. | `reward_mode` in `configs.yaml`; branch in `get_reward_and_done`. | Reward intervention condition (`pbrs` is policy-invariant). |
 | Independent | Observation mode (odometry ablation) | `none`, `twist`, `delta`, `full`, or `full_imu` odometry feature block (`full_imu` = `full` + 2-D `/imu` linear acceleration). | `odometry_mode`; observation-space branches in `turtle.py`. | Perception-input condition. |
 | Independent | LiDAR resolution | Number of LiDAR beams (`lidar`, default 360). | `lidar` config; sub-sampling in `get_state`. | Perception-fidelity condition. |
 | Independent | Random seed | Integer seed for reproducibility across runs. | `seed` config. | Repetition and variance control. |
@@ -483,7 +498,7 @@ quantity (no analysis is proposed for a metric that is not logged):
   mode, and seed fixed; the learning algorithm is identical and only the observation
   input changes.
 - **Comparison across reward modes and stages.** Compare `default` versus `shaped`
-  reward, and stage 1 to 8, on the same dependent variables.
+  versus `pbrs` reward, and stage 1 to 8, on the same dependent variables.
 - **Learning stability.** Use `reward_variance`, the latent `kl`, and the prior and
   posterior entropies as white-box stability indicators, and repeat runs across
   seeds to estimate variance.
@@ -520,8 +535,10 @@ These limitations are grounded strictly in the implementation and the audit:
   physically followable; in very narrow passages A-star reports `no_path` (blank
   efficiency) rather than overstating feasibility — it never returns a path the
   robot could not follow (**implemented**).
-- **Reward modes are limited to two.** Only `default` and `shaped` exist; **traffic
-  shaping and other reward modes are not found.**
+- **Reward modes are limited to three.** Only `default`, `shaped`, and `pbrs` exist;
+  **traffic shaping and A\*-guided reward are not found** (A\* is a post-hoc metric
+  only). All three are reward-only and leave the agent architecture, observation
+  space, and action space unchanged.
 - **Bayesian optimisation is an outer loop, not part of the agent.** Optuna tuning
   wraps `dreamer.py` and reads the eval CSVs to score candidates; it does not modify
   the world model, policy, observation space, or action space (**implemented**).
@@ -550,7 +567,7 @@ These limitations are grounded strictly in the implementation and the audit:
 - **Seeds.** A `seed` parameter is exposed and threaded into the run; repeating a
   run with a different seed estimates variance, and the same seed reproduces a run.
 - **Logdir naming convention.** Reward-shaping experiments follow
-  `./logdir/stage{N}_360_none_seed{S}_reward_{default|shaped}`; odometry-ablation
+  `./logdir/stage{N}_360_none_seed{S}_reward_{default|shaped|pbrs}`; odometry-ablation
   runs follow `./logdir/stage{N}_{lidar}_{mode}_seed{S}`. The run name used for CSV
   filenames is the final component of `--logdir`.
 - **Resume.** A run resumes from `latest.pt` if present; the best evaluation

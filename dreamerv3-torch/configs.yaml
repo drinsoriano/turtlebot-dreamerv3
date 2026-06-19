@@ -44,6 +44,14 @@ defaults:
   pbrs_distance_scale: 5.0
   pbrs_gamma: 0.997
 
+  # Fixed-goal mode (diagnostic path-efficiency test; default '' = normal random goals).
+  # Set a ';'-separated 'x,y' list to pin the goal to a small fixed set, e.g.
+  # '2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0'. Works on any stage 1-8; composes with any
+  # --odometry_mode / --reward_mode. fixed_goals_random: False = round-robin order,
+  # True = random pick from the set each episode (both seeded/reproducible).
+  fixed_goals: ''
+  fixed_goals_random: False
+
   # Environment
   task: 'turtle'
   time_limit: 250

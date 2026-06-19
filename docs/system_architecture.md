@@ -128,8 +128,14 @@ control loop. The exact mapping is documented in
 Reward and episode termination are computed in `get_reward_and_done()`:
 a success reward when the goal acceptance radius is reached, a collision penalty
 when the minimum LiDAR range drops below a threshold, and a timeout penalty at
-the step limit; otherwise zero. An **optional additive shaping** mode augments
-this sparse signal. Details are in
+the step limit; otherwise zero. This terminal reward is identical under **three
+opt-in reward modes** selected by `--reward_mode`: `default` (sparse only),
+`shaped` (adds four hand-weighted per-step terms), and `pbrs` (adds one
+potential-based, *policy-invariant* term). **All three differ only inside this
+environment method** — the world model, actor, critic, observation space, and
+action space are byte-for-byte unchanged by the reward mode, so reward shaping
+(including PBRS) is **not** an architecture change. See the data-flow diagram and
+full details in [reward_shaping.md](reward_shaping.md) and
 [training_and_evaluation_pipeline.md](training_and_evaluation_pipeline.md).
 
 ### Disk-backed replay

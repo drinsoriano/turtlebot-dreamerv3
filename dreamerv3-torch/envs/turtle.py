@@ -79,6 +79,7 @@ class Env(Node):
                  reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
                  pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                  pbrs_distance_scale=5.0, pbrs_gamma=0.997,
+                 fixed_goals='', fixed_goals_random=False,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super().__init__("trainer_node")
 
@@ -105,6 +106,7 @@ class Env(Node):
                              reward_near_obstacle_scale, reward_near_obstacle_sigma,
                              pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
                              pbrs_distance_scale, pbrs_gamma,
+                             fixed_goals, fixed_goals_random,
                              csv_dir, plots_dir)
 
     def pause_simulation(self):
@@ -135,6 +137,7 @@ class Env(Node):
                         reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
                         pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                         pbrs_distance_scale=5.0, pbrs_gamma=0.997,
+                        fixed_goals='', fixed_goals_random=False,
                         csv_dir='./csv_logs', plots_dir='./path_plots'):
         self.num_states = 14
         self.num_actions = 2
@@ -149,6 +152,27 @@ class Env(Node):
         self.max_steps = max_steps
         self.lidar = lidar
         self.odometry_mode = odometry_mode
+
+        # Fixed-goal mode (diagnostic): '' = normal random sampling. Else parse the
+        # ';'-separated 'x,y' list once into self.fixed_goal_list; round-robin (or random
+        # per fixed_goals_random) selection happens in generate_random_target_position().
+        # Malformed string → fall back to random (never crash training).
+        self.fixed_goals_random = bool(fixed_goals_random)
+        self.fixed_goal_list = None
+        self.fixed_goal_idx = 0
+        if fixed_goals:
+            try:
+                self.fixed_goal_list = [
+                    (float(p.split(',')[0]), float(p.split(',')[1]))
+                    for p in fixed_goals.split(';') if p.strip()
+                ] or None
+            except Exception:
+                print(f"[turtle] WARNING: could not parse --fixed_goals '{fixed_goals}'; "
+                      "falling back to random goal sampling.")
+                self.fixed_goal_list = None
+        if self.fixed_goal_list:
+            order = 'random' if self.fixed_goals_random else 'round-robin'
+            print(f"[turtle] Fixed-goal mode ON ({order}): {self.fixed_goal_list}")
 
         # Thesis metrics tracking
         self.episode_count = 0
@@ -225,6 +249,7 @@ class Env(Node):
                 'rolling_success_rate_100', 'rolling_collision_rate_100',
                 'rolling_success_rate_500', 'rolling_collision_rate_500',
                 'episode_steps',
+                'goal_id',
             ])
         self._bb_file.flush()
 
@@ -484,6 +509,7 @@ class Env(Node):
             rs100, rc100,
             rs500, rc500,
             self.step_counter,   # episode_steps: total steps this episode (all outcomes)
+            self._goal_id(),
         ])
         self._bb_file.flush()
 
@@ -505,6 +531,7 @@ class Env(Node):
                 'planned_path_length_center',
                 'planner_path_efficiency_center', 'planner_path_efficiency_center_raw',
                 'planner_status_center',
+                'goal_id',
             ])
         self._pl_file.flush()
 
@@ -578,6 +605,7 @@ class Env(Node):
             round(actual, 4),
             reg_out, reg_capped, reg_raw, reg_status,
             cen_out, cen_capped, cen_raw, cen_status,
+            self._goal_id(),
         ])
         self._pl_file.flush()
 
@@ -918,7 +946,30 @@ class Env(Node):
                 "Supported stages are 1–8. Check --stage and the Gazebo launch file."
             )
 
+    def _goal_id(self):
+        """Coordinate-derived per-episode goal tag (stable across runs/modes).
+
+        Identical goal coordinates → identical id, so episodes sharing a goal can be
+        grouped/compared later (e.g. per-goal path-efficiency improvement). Works in
+        both random and fixed-goal modes. E.g. '+2.00_-2.00'.
+        """
+        return f"{self.target_x:+.2f}_{self.target_y:+.2f}"
+
     def generate_random_target_position(self):
+        # Fixed-goal mode (diagnostic): pin the goal to the chosen set instead of
+        # sampling. Round-robin by default, or random pick if fixed_goals_random.
+        # Both selectors are seeded (tools.set_seed_everywhere seeds `random`), so the
+        # sequence is reproducible per --seed. Everything downstream (marker spawn,
+        # distance/angle, reward, A*) reads self.target_x/y unchanged.
+        if self.fixed_goal_list:
+            if self.fixed_goals_random:
+                self.target_x, self.target_y = random.choice(self.fixed_goal_list)
+            else:
+                self.target_x, self.target_y = \
+                    self.fixed_goal_list[self.fixed_goal_idx % len(self.fixed_goal_list)]
+                self.fixed_goal_idx += 1
+            return self.target_x, self.target_y
+
         # Robot always resets to (0.0, 0.0) via /reset_simulation.
         robot_x, robot_y = 0.0, 0.0
 
@@ -962,6 +1013,7 @@ class Turtle(gym.Env):
                  reward_near_obstacle_scale=0.1, reward_near_obstacle_sigma=0.25,
                  pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                  pbrs_distance_scale=5.0, pbrs_gamma=0.997,
+                 fixed_goals='', fixed_goals_random=False,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super(Turtle, self).__init__()
         self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
@@ -971,6 +1023,7 @@ class Turtle(gym.Env):
                         reward_near_obstacle_scale, reward_near_obstacle_sigma,
                         pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
                         pbrs_distance_scale, pbrs_gamma,
+                        fixed_goals, fixed_goals_random,
                         csv_dir, plots_dir)
 
         self.observation_space = spaces.Dict({

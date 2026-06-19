@@ -76,19 +76,59 @@ def scan_runs() -> list[str]:
     return sorted(runs)
 
 
+def _safe_read_csv(path, **kwargs) -> pd.DataFrame:
+    """pd.read_csv with a fallback for live / mid-write CSVs.
+
+    The env writes CSVs while training, and a run resumed after a mid-run schema
+    change (e.g. the appended `goal_id` column) leaves a file whose header is
+    narrower than its newer rows. Either case makes the fast pandas parser raise
+    (`Error tokenizing data` / `line contains NUL`). The fallback strips NUL bytes
+    from partial writes and normalises ragged rows — padding short rows and naming
+    any extra trailing column(s) — so **all** rows are preserved and dtypes are
+    still inferred. Returns an empty frame only if the file is truly unreadable.
+    """
+    try:
+        return pd.read_csv(path, **kwargs)
+    except Exception:
+        pass
+    try:
+        import csv as _csv
+        from io import StringIO
+        with open(path, "rb") as fh:
+            text = fh.read().replace(b"\x00", b"").decode("utf-8", "replace")
+        rows = [r for r in _csv.reader(StringIO(text)) if r]
+        if not rows:
+            return pd.DataFrame()
+        header, maxw = rows[0], max(len(r) for r in rows)
+        if len(header) < maxw:
+            # Known mid-run append is `goal_id`; name a single extra column that,
+            # else fall back to positional names so nothing is dropped.
+            extra = (["goal_id"] if maxw - len(header) == 1
+                     else [f"col_{i}" for i in range(len(header), maxw)])
+            header = header + extra
+        out = StringIO()
+        w = _csv.writer(out)
+        w.writerow(header)
+        for r in rows[1:]:
+            w.writerow((r + [""] * (maxw - len(r)))[:maxw])
+        out.seek(0)
+        return pd.read_csv(out, **kwargs)
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def load_bb(run_name: str) -> pd.DataFrame:
     p = CSV_DIR / f"blackbox_{run_name}.csv"
     if not p.exists():
         return pd.DataFrame()
-    try:
-        df = pd.read_csv(p)
-        df["_idx"] = range(len(df))
-        if "path_efficiency" in df.columns and "path_directness" not in df.columns:
-            df = df.rename(columns={"path_efficiency": "path_directness"})
+    df = _safe_read_csv(p)
+    if df.empty:
         return df
-    except Exception:
-        return pd.DataFrame()
+    df["_idx"] = range(len(df))
+    if "path_efficiency" in df.columns and "path_directness" not in df.columns:
+        df = df.rename(columns={"path_efficiency": "path_directness"})
+    return df
 
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -96,10 +136,7 @@ def load_wb(run_name: str) -> pd.DataFrame:
     p = CSV_DIR / f"whitebox_{run_name}.csv"
     if not p.exists():
         return pd.DataFrame()
-    try:
-        return pd.read_csv(p)
-    except Exception:
-        return pd.DataFrame()
+    return _safe_read_csv(p)
 
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -111,8 +148,9 @@ def load_tune_trials() -> pd.DataFrame:
     if not files:
         return pd.DataFrame()
     try:
-        dfs = [pd.read_csv(f) for f in files]
-        return pd.concat(dfs, ignore_index=True)
+        dfs = [_safe_read_csv(f) for f in files]
+        dfs = [d for d in dfs if not d.empty]
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -122,10 +160,57 @@ def load_pl(run_name: str) -> pd.DataFrame:
     p = CSV_DIR / f"planning_{run_name}.csv"
     if not p.exists():
         return pd.DataFrame()
-    try:
-        return pd.read_csv(p)
-    except Exception:
+    return _safe_read_csv(p)
+
+
+# ─── Cross-folder loaders (used by the Compare / Convergence tabs) ────────────
+# The per-run tabs read from the single sidebar-selected CSV_DIR. The Compare and
+# Convergence tabs instead overlay runs from *different* auto-organized folders
+# (e.g. none_stage4/ vs full_imu_stage4/), so they discover and load by explicit
+# (folder, run) — independent of CSV_DIR.
+
+def _folder_base(folder: str) -> Path:
+    return CSV_BASE if folder == "." else CSV_BASE / folder
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def scan_all_runs() -> list[tuple[str, str, str]]:
+    """(folder, run, label) across every CSV folder. label = run for the '.' base,
+    else 'folder/run'. Excludes eval_* stems — the eval variant of a run is reached
+    via the phase toggle, not listed as its own run."""
+    out: list[tuple[str, str, str]] = []
+    for folder in list_csv_folders():
+        base, runs = _folder_base(folder), set()
+        for pfx in ("blackbox", "whitebox", "planning"):
+            for f in base.glob(f"{pfx}_*.csv"):
+                stem = f.stem.removeprefix(f"{pfx}_")
+                if not stem.startswith("eval_"):
+                    runs.add(stem)
+        for r in sorted(runs):
+            out.append((folder, r, r if folder == "." else f"{folder}/{r}"))
+    return out
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def load_bb_in(folder: str, run_name: str) -> pd.DataFrame:
+    """Folder-aware twin of load_bb (reads {folder}/blackbox_{run}.csv)."""
+    p = _folder_base(folder) / f"blackbox_{run_name}.csv"
+    if not p.exists():
         return pd.DataFrame()
+    df = _safe_read_csv(p)
+    if df.empty:
+        return df
+    df["_idx"] = range(len(df))
+    if "path_efficiency" in df.columns and "path_directness" not in df.columns:
+        df = df.rename(columns={"path_efficiency": "path_directness"})
+    return df
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def load_pl_in(folder: str, run_name: str) -> pd.DataFrame:
+    """Folder-aware twin of load_pl (reads {folder}/planning_{run}.csv)."""
+    p = _folder_base(folder) / f"planning_{run_name}.csv"
+    return _safe_read_csv(p) if p.exists() else pd.DataFrame()
 
 
 RESOURCE_NUMERIC_COLS = [
@@ -144,14 +229,13 @@ def load_resource(run_name: str) -> pd.DataFrame:
     p = CSV_DIR / f"resource_{run_name}.csv"
     if not p.exists():
         return pd.DataFrame()
-    try:
-        df = pd.read_csv(p, dtype=str)  # str to avoid mixed-type on blank GPU fields
-        for col in RESOURCE_NUMERIC_COLS:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = _safe_read_csv(p, dtype=str)  # str to avoid mixed-type on blank GPU fields
+    if df.empty:
         return df
-    except Exception:
-        return pd.DataFrame()
+    for col in RESOURCE_NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -161,14 +245,13 @@ def load_resource_eval(run_name: str) -> pd.DataFrame:
     p = CSV_DIR / f"resource_eval_{run_name}.csv"
     if not p.exists():
         return pd.DataFrame()
-    try:
-        df = pd.read_csv(p, dtype=str)
-        for col in RESOURCE_NUMERIC_COLS:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = _safe_read_csv(p, dtype=str)
+    if df.empty:
         return df
-    except Exception:
-        return pd.DataFrame()
+    for col in RESOURCE_NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 # ─── Stat helpers ─────────────────────────────────────────────────────────────
@@ -434,6 +517,116 @@ def _section_comparison(selected: list, bb_data: dict, wb_data: dict):
         st.dataframe(display_comparison, width="stretch", hide_index=True)
 
 
+def _section_eval_checkpoints(selected: list, n_per_ckpt: int):
+    """Eval Checkpoint Summary — last and best checkpoint performance."""
+    st.subheader("Eval Checkpoint Summary")
+    st.caption(
+        "Slices `blackbox_eval_*.csv` and `planning_eval_*.csv` into fixed-size blocks "
+        "(one block = one eval checkpoint). "
+        "**Last** = final trained policy. "
+        "**Best** = checkpoint with highest eval success rate (peak capability)."
+    )
+
+    summary_rows = []
+
+    for run in selected:
+        eval_key = f"eval_{run}"
+        bb_eval = load_bb(eval_key)
+        pl_eval = load_pl(eval_key)
+
+        if bb_eval.empty:
+            st.caption(f"*{run} — no eval data (`blackbox_eval_{run}.csv` not found or empty)*")
+            continue
+
+        n_total = len(bb_eval)
+        n_ckpts = max(1, n_total // n_per_ckpt)
+
+        def _chunk_stats(bb_chunk: pd.DataFrame, pl_chunk: pd.DataFrame) -> dict:
+            if bb_chunk.empty:
+                return {}
+            n = len(bb_chunk)
+            outcomes = bb_chunk["outcome"] if "outcome" in bb_chunk.columns else pd.Series(dtype=str)
+            suc_pct  = round((outcomes == "success").sum()   / n * 100, 1)
+            col_pct  = round((outcomes == "collision").sum() / n * 100, 1)
+            mean_ppe = None
+            if not pl_chunk.empty and "planner_path_efficiency" in pl_chunk.columns:
+                ok = pl_chunk[pl_chunk["planner_status"] == "ok"] \
+                    if "planner_status" in pl_chunk.columns else pl_chunk
+                vals = pd.to_numeric(ok["planner_path_efficiency"], errors="coerce").dropna()
+                if not vals.empty:
+                    mean_ppe = round(float(vals.mean()), 4)
+            return {"n": n, "success_%": suc_pct, "collision_%": col_pct, "mean_ppe": mean_ppe}
+
+        # Last checkpoint
+        last_bb   = bb_eval.tail(n_per_ckpt)
+        last_pl   = pl_eval.tail(n_per_ckpt) if not pl_eval.empty else pd.DataFrame()
+        last_stat = _chunk_stats(last_bb, last_pl)
+
+        # Best checkpoint — scan all complete blocks
+        best_idx  = 0
+        best_suc  = -1.0
+        for i in range(n_ckpts):
+            chunk = bb_eval.iloc[i * n_per_ckpt:(i + 1) * n_per_ckpt]
+            if chunk.empty or "outcome" not in chunk.columns:
+                continue
+            s = (chunk["outcome"] == "success").sum() / len(chunk) * 100
+            if s > best_suc:
+                best_suc = s
+                best_idx = i
+        best_bb   = bb_eval.iloc[best_idx * n_per_ckpt:(best_idx + 1) * n_per_ckpt]
+        best_pl   = pl_eval.iloc[best_idx * n_per_ckpt:(best_idx + 1) * n_per_ckpt] \
+                    if not pl_eval.empty else pd.DataFrame()
+        best_stat = _chunk_stats(best_bb, best_pl)
+
+        with st.expander(
+            f"**{run}** — {n_total} eval eps · {n_ckpts} checkpoint(s)",
+            expanded=True,
+        ):
+            c_last, c_best = st.columns(2)
+
+            with c_last:
+                st.markdown("**Last checkpoint** *(final trained policy)*")
+                if last_stat:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Success",    f"{last_stat['success_%']}%")
+                    m2.metric("Collision",  f"{last_stat['collision_%']}%")
+                    m3.metric("Mean PPE",
+                              _fmt(last_stat["mean_ppe"], 4) if last_stat["mean_ppe"] else "—")
+
+            with c_best:
+                st.markdown(
+                    f"**Best checkpoint** *(ckpt #{best_idx + 1} of {n_ckpts}, "
+                    f"by success rate)*"
+                )
+                if best_stat:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Success",    f"{best_stat['success_%']}%")
+                    m2.metric("Collision",  f"{best_stat['collision_%']}%")
+                    m3.metric("Mean PPE",
+                              _fmt(best_stat["mean_ppe"], 4) if best_stat["mean_ppe"] else "—")
+
+        summary_rows.append({
+            "run":               run,
+            "total_eval_eps":    n_total,
+            "n_checkpoints":     n_ckpts,
+            "last_success_%":    last_stat.get("success_%"),
+            "last_collision_%":  last_stat.get("collision_%"),
+            "last_mean_ppe":     last_stat.get("mean_ppe"),
+            "best_ckpt#":        best_idx + 1,
+            "best_success_%":    best_stat.get("success_%"),
+            "best_collision_%":  best_stat.get("collision_%"),
+            "best_mean_ppe":     best_stat.get("mean_ppe"),
+        })
+
+    if len(summary_rows) > 1:
+        st.divider()
+        st.markdown("**Cross-run comparison**")
+        cmp_df = pd.DataFrame(summary_rows)
+        for col in cmp_df.select_dtypes(include="object").columns:
+            cmp_df[col] = cmp_df[col].astype(str)
+        st.dataframe(cmp_df, width="stretch", hide_index=True, key="eval_ckpt_cmp")
+
+
 def _section_bb(selected: list, bb_data: dict, show_cumulative: bool, show_r100: bool, show_r500: bool):
     run_map = {r: bb_data[r] for r in selected}
     specs = [
@@ -676,6 +869,155 @@ def _section_resource(run_name: str, res_df: pd.DataFrame, res_eval_df: pd.DataF
         st.dataframe(display_df, width="stretch", key=f"res_raw_{run_name}")
 
 
+# Per-goal drill-down metrics: label -> (source, column). "_success01" is derived
+# on the fly from outcome (its rolling mean = the per-goal success rate over time).
+_GOAL_METRICS = {
+    "Path Efficiency":        ("planning", "planner_path_efficiency"),
+    "Success (per episode)":  ("blackbox", "_success01"),
+    "Actual Path Length (m)": ("planning", "actual_path_length"),
+    "Episode Steps":          ("blackbox", "episode_steps"),
+    "Path Directness":        ("blackbox", "path_directness"),
+    "Min Obstacle Dist (m)":  ("blackbox", "min_obstacle_dist"),
+    "Near Collisions":        ("blackbox", "near_collisions"),
+}
+# Metrics bounded to [0, 1] — fix the y-axis for these so trends are comparable.
+_GOAL_METRICS_UNIT = {"planner_path_efficiency", "_success01", "path_directness"}
+
+
+def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame,
+                           roll_window: int) -> None:
+    """🔍 Per-goal learning — pick one goal_id and watch a chosen metric over its
+    episode sequence: is the robot improving on the *same* goal (shorter paths,
+    more reliable), or regressing (colliding again after earlier successes)?"""
+    # goal_id may live in pl_df and/or bb_df; use whichever has non-blank values.
+    def _gids(df):
+        if df is None or df.empty or "goal_id" not in df.columns:
+            return pd.Series(dtype=str)
+        s = df["goal_id"].astype(str)
+        return s[s.str.strip().ne("") & s.ne("nan") & s.ne("None")]
+
+    gids = pd.concat([_gids(pl_df), _gids(bb_df)], ignore_index=True)
+    if gids.empty:
+        return  # no goal_id data — render nothing (graceful)
+
+    st.subheader("🔍 Per-goal learning — same goal over time")
+    st.caption(
+        "Pick one goal (a fixed coordinate) and a metric to see whether the robot "
+        "**improves on that goal** as training proceeds. Markers are coloured by "
+        "outcome, so a red point after green points = it collided again though it "
+        "had succeeded on this goal before."
+    )
+
+    counts = gids.value_counts()
+    c1, c2 = st.columns([3, 3])
+    with c1:
+        goal = st.selectbox(
+            "Goal (by appearance count)", list(counts.index),
+            format_func=lambda g: f"{g}  (n={int(counts[g])})",
+            key=f"plan_goalsel_{run_name}",
+        )
+    with c2:
+        avail = [lbl for lbl, (src, col) in _GOAL_METRICS.items()
+                 if col == "_success01"
+                 or col in (pl_df.columns if src == "planning" else bb_df.columns)]
+        metric_label = st.selectbox("Metric", avail, key=f"plan_goalmetric_{run_name}")
+
+    src, col = _GOAL_METRICS[metric_label]
+    base = pl_df if src == "planning" else bb_df
+    if base is None or base.empty or "goal_id" not in base.columns \
+            or "episode" not in base.columns:
+        st.caption(f"*No `{metric_label}` data with goal_id for this run.*")
+        return
+
+    g = base[base["goal_id"].astype(str) == str(goal)].copy()
+    if src == "planning" and "planner_status" in g.columns:
+        g = g[g["planner_status"] == "ok"]
+    if "outcome" in g.columns and col == "_success01":
+        g["_success01"] = (g["outcome"] == "success").astype(int)
+    if g.empty or col not in g.columns:
+        st.caption(f"*No `{metric_label}` rows for goal {goal}.*")
+        return
+
+    g = g.sort_values("episode")
+    yv = pd.to_numeric(g[col], errors="coerce")
+
+    # ── Outcome-coloured scatter + rolling trend ──────────────────────────────
+    fig = go.Figure()
+    if "outcome" in g.columns:
+        for oc, oc_color in OUTCOME_TEXT_COLORS.items():
+            m = g["outcome"] == oc
+            if m.any():
+                fig.add_trace(go.Scatter(
+                    x=g.loc[m, "episode"], y=yv[m], mode="markers", name=oc,
+                    marker=dict(size=6, color=oc_color),
+                ))
+    else:
+        fig.add_trace(go.Scatter(x=g["episode"], y=yv, mode="markers",
+                                 name=metric_label, marker=dict(size=6)))
+    fig.add_trace(go.Scatter(
+        x=g["episode"], y=yv.rolling(roll_window, min_periods=1).mean(),
+        mode="lines", name=f"Rolling {roll_window}",
+        line=dict(width=2, color="#1f77b4", dash="dash"),
+    ))
+    ylo_hi = dict(range=[0, 1.05]) if col in _GOAL_METRICS_UNIT else {}
+    fig.update_layout(
+        xaxis_title="Episode", yaxis_title=metric_label, yaxis=ylo_hi,
+        height=360, margin=dict(l=50, r=20, t=30, b=40), legend=dict(font_size=10),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"plan_goalcurve_{run_name}")
+
+    # ── Improvement summary: first third vs last third (by episode order) ──────
+    n = len(g)
+    if n >= 6:
+        k = max(1, n // 3)
+        first, last = g.iloc[:k], g.iloc[-k:]
+
+        def _rate(df, oc):
+            return round((df["outcome"] == oc).mean() * 100, 1) if "outcome" in df else None
+
+        def _avg(df):
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            return float(s.mean()) if not s.empty else None
+
+        def _delta(a, b):
+            return f"{b - a:+.1f}" if (a is not None and b is not None) else None
+
+        st.caption(f"**Improvement** — first {k} vs last {k} appearances of this goal")
+        m1, m2, m3 = st.columns(3)
+        sf, sl = _rate(first, "success"), _rate(last, "success")
+        cf, cl = _rate(first, "collision"), _rate(last, "collision")
+        af, al = _avg(first), _avg(last)
+        m1.metric("Success rate", _fmt(sl, 1, "%"), _delta(sf, sl))
+        m2.metric("Collision rate", _fmt(cl, 1, "%"),
+                  _delta(cf, cl), delta_color="inverse")
+        m3.metric(f"{metric_label} (mean)", _fmt(al, 3), _delta(af, al))
+
+    # ── Filtered episode table (planning + blackbox merged on episode) ────────
+    cols_pl = [c for c in ["episode", "datetime", "outcome",
+                           "planner_path_efficiency", "actual_path_length"]
+               if c in pl_df.columns]
+    tbl = pl_df[pl_df["goal_id"].astype(str) == str(goal)][cols_pl].copy() \
+        if (not pl_df.empty and "goal_id" in pl_df.columns) else pd.DataFrame()
+    if not bb_df.empty and "goal_id" in bb_df.columns:
+        cols_bb = [c for c in ["episode", "episode_steps", "min_obstacle_dist",
+                               "near_collisions"] if c in bb_df.columns]
+        bbg = bb_df[bb_df["goal_id"].astype(str) == str(goal)][cols_bb]
+        if not tbl.empty and "episode" in cols_bb:
+            tbl = tbl.merge(bbg, on="episode", how="left")
+        elif tbl.empty:
+            tbl = bbg
+    if not tbl.empty:
+        tbl = tbl.sort_values("episode")
+        try:
+            styled = tbl.style.map(_color_outcome_text, subset=["outcome"]) \
+                if "outcome" in tbl.columns else tbl.style
+            st.dataframe(styled, width="stretch", hide_index=True,
+                         key=f"plan_goaltbl_{run_name}")
+        except Exception:
+            st.dataframe(tbl.astype(str), width="stretch", hide_index=True,
+                         key=f"plan_goaltbl_fb_{run_name}")
+
+
 def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     if pl_df.empty:
         st.info(f"No planning CSV found for **{run_name}**. "
@@ -730,8 +1072,31 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     st.subheader("Planner Path Efficiency vs Episode")
     roll_window = st.slider("Rolling average window", 5, 100, 25, key=f"roll_{run_name}")
 
+    # Per-goal grouping (fixed-goal experiments): one rolling-mean series per goal_id,
+    # so you see whether each goal's path tightens over training. Degrades silently
+    # on older CSVs without the column.
+    has_goal_id = "goal_id" in pl_df.columns and pl_df["goal_id"].nunique() > 1
+    group_by_goal = False
+    if has_goal_id:
+        group_by_goal = st.checkbox(
+            f"Group by goal_id ({pl_df['goal_id'].nunique()} goals) — one rolling series per goal",
+            value=False, key=f"plan_goalgrp_{run_name}",
+        )
+
     fig = go.Figure()
-    if "episode" in pl_df.columns and "planner_path_efficiency" in pl_df.columns:
+    if group_by_goal:
+        for i, (gid, g) in enumerate(pl_df.groupby("goal_id")):
+            ok = g[g["planner_status"] == "ok"] if "planner_status" in g.columns else g
+            if ok.empty or "planner_path_efficiency" not in ok.columns:
+                continue
+            rolled_g = ok["planner_path_efficiency"].rolling(roll_window, min_periods=1).mean()
+            fig.add_trace(go.Scatter(
+                x=ok["episode"], y=rolled_g,
+                mode="lines+markers", name=str(gid),
+                marker=dict(size=3), line=dict(width=1.6, color=_clr(i)),
+                connectgaps=False,
+            ))
+    elif "episode" in pl_df.columns and "planner_path_efficiency" in pl_df.columns:
         fig.add_trace(go.Scatter(
             x=pl_df["episode"],
             y=pl_df["planner_path_efficiency"],
@@ -749,7 +1114,7 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             name=f"Rolling {roll_window} (region)",
             line=dict(width=2, color=PALETTE[0], dash="dash"),
         ))
-    if "planner_path_efficiency_center" in pl_df.columns:
+    if not group_by_goal and "planner_path_efficiency_center" in pl_df.columns:
         fig.add_trace(go.Scatter(
             x=pl_df["episode"],
             y=pl_df["planner_path_efficiency_center"],
@@ -775,10 +1140,14 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     )
     st.plotly_chart(fig, use_container_width=True, key=f"plan_{run_name}")
 
+    # ── Per-goal learning drill-down (one goal over time, any metric) ──────────
+    st.divider()
+    _section_goal_learning(run_name, pl_df, bb_df, roll_window)
+
     # ── Planning table (clickable — click a row to view its path plot) ──────────
     st.subheader("Planning Log  —  click a row to view its path plot")
     display_cols = [c for c in [
-        "episode", "outcome",
+        "episode", "outcome", "goal_id",
         "planner_status", "planner_path_efficiency", "planner_path_efficiency_raw",
         "planner_status_center", "planner_path_efficiency_center", "planner_path_efficiency_center_raw",
         "initial_distance", "actual_path_length",
@@ -1310,20 +1679,23 @@ _CMP_METRICS = {
 
 
 def _section_compare():
-    """🔀 Compare — overlay any metric vs episode across arbitrary runs."""
-    all_runs = scan_runs()
-    if not all_runs:
-        st.info("← No runs detected in the current CSV folder. Select a folder in the sidebar.")
+    """🔀 Compare — overlay any metric vs episode across arbitrary runs (any folder)."""
+    run_index = scan_all_runs()  # (folder, run, label) across ALL folders
+    if not run_index:
+        st.info("← No runs detected in any CSV folder.")
         return
+    labels = [label for _, _, label in run_index]
+    label_to_fr = {label: (folder, run) for folder, run, label in run_index}
 
     # ── Controls ──────────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns([4, 2, 3, 2])
     with c1:
         sel_runs = st.multiselect(
-            "Runs to compare", all_runs,
-            default=all_runs[:min(2, len(all_runs))],
+            "Runs to compare (any folder)", labels,
+            default=labels[:min(2, len(labels))],
             key="cmp_runs",
-            help="Pick any combination of runs — different stages, reward modes, seeds, trials, etc.",
+            help="Pick any combination across folders — e.g. none_stage4/… vs "
+                 "full_imu_stage4/…, different reward modes, stages, seeds, trials.",
         )
     with c2:
         phase = st.radio(
@@ -1351,15 +1723,16 @@ def _section_compare():
     fig = go.Figure()
     skipped: list[str] = []
 
-    for i, run in enumerate(sel_runs):
+    for i, sel_label in enumerate(sel_runs):
         color = _clr(i)
+        folder, run = label_to_fr[sel_label]
         for ph in phases:
-            load_key = f"eval_{run}" if ph == "eval" else run
+            load_run = f"eval_{run}" if ph == "eval" else run
             dash = "solid" if ph == "train" else "dash"
-            label = f"{run} ({ph})" if phase == "Both" else run
+            label = f"{sel_label} ({ph})" if phase == "Both" else sel_label
 
             if src == "planning":
-                df = load_pl(load_key)
+                df = load_pl_in(folder, load_run)
                 if df.empty or col not in df.columns:
                     skipped.append(label)
                     continue
@@ -1369,7 +1742,7 @@ def _section_compare():
                 series = pd.to_numeric(df[col], errors="coerce").where(ok_mask)
                 x = df["episode"] if "episode" in df.columns else pd.RangeIndex(len(df))
             else:
-                df = load_bb(load_key)
+                df = load_bb_in(folder, load_run)
                 if df.empty or col not in df.columns:
                     skipped.append(label)
                     continue
@@ -1417,10 +1790,12 @@ _CONV_METRICS = {
 
 def _section_convergence():
     """🎯 Convergence — where a run plateaus, and how much budget was 'excess'."""
-    all_runs = scan_runs()
-    if not all_runs:
-        st.info("← No runs detected in the current CSV folder. Select a folder in the sidebar.")
+    run_index = scan_all_runs()  # (folder, run, label) across ALL folders
+    if not run_index:
+        st.info("← No runs detected in any CSV folder.")
         return
+    labels = [label for _, _, label in run_index]
+    label_to_fr = {label: (folder, run) for folder, run, label in run_index}
 
     st.caption(
         "Detects where each run **plateaus** (metric settles within a tolerance "
@@ -1432,10 +1807,10 @@ def _section_convergence():
     c1, c2, c3, c4 = st.columns([4, 3, 2, 2])
     with c1:
         sel_runs = st.multiselect(
-            "Runs", all_runs,
-            default=all_runs[:min(2, len(all_runs))],
+            "Runs (any folder)", labels,
+            default=labels[:min(2, len(labels))],
             key="conv_runs",
-            help="Pick any runs — train trials, validation, different stages.",
+            help="Pick any runs across folders — none vs full_imu, reward modes, stages.",
         )
     with c2:
         metric_label = st.selectbox(
@@ -1463,8 +1838,9 @@ def _section_convergence():
 
     for i, run in enumerate(sel_runs):
         color = _clr(i)
+        folder, run_name = label_to_fr[run]  # `run` is the folder-qualified label
         if src == "planning":
-            df = load_pl(run)
+            df = load_pl_in(folder, run_name)
             if df.empty or col not in df.columns:
                 skipped.append(run)
                 continue
@@ -1474,7 +1850,7 @@ def _section_convergence():
             series = pd.to_numeric(df[col], errors="coerce").where(ok_mask)
             x = df["episode"] if "episode" in df.columns else pd.RangeIndex(len(df))
         else:
-            df = load_bb(run)
+            df = load_bb_in(folder, run_name)
             if df.empty or col not in df.columns:
                 skipped.append(run)
                 continue
@@ -1715,6 +2091,59 @@ python3 dreamer.py --configs turtle --task turtle \\
   --device cuda --steps 300000 --eval_episode_num 100""",
         language="bash",
     )
+
+    # ── Fixed-goal experiment ─────────────────────────────────────────────────
+    st.markdown(
+        "**Fixed-goal experiment** (diagnostic path-efficiency test) — pin the goal to "
+        "a small **fixed set** instead of random sampling, so path efficiency is measured "
+        "on the *same* navigation problem(s) every episode. `--fixed_goals` is a "
+        "`;`-separated `x,y` list (any count: 1, 4, 5, …); it **composes with any** "
+        "`--odometry_mode` and `--reward_mode`. `--fixed_goals_random` picks the order: "
+        "`False` = round-robin (default, balanced), `True` = random pick from the set. "
+        "Use a **fresh logdir** with a `_fixedgoal` suffix. Every episode is tagged with "
+        "a coordinate-derived `goal_id` in `planning_*`/`blackbox_*.csv` so you can group "
+        "and compare per goal (Path Efficiency tab → *Group by goal_id*)."
+    )
+    st.markdown("**Step 0 — preview the goals first** (no Gazebo/GPU; red = A\\*-blocked):")
+    st.code(
+        """cd ~/turtlebot-dreamerv3/dreamerv3-torch
+# Stage 1 (empty — sanity, optimal ≈ straight line)
+python3 preview_fixed_goals.py --stage 1 \\
+  --fixed_goals "1.7,1.7;-1.7,1.7;1.7,-1.7;-1.7,-1.7"
+# Stage 4 (cluttered — goals require detours)
+python3 preview_fixed_goals.py --stage 4 \\
+  --fixed_goals "2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0"
+# → path_plots/fixed_goals_preview_stage{N}.png""",
+        language="bash",
+    )
+    st.markdown(
+        "**The 3-way comparison** — same `--fixed_goals`, vary only `--reward_mode` "
+        "(`default` / `shaped` / `pbrs`). `--odometry_mode` composes freely "
+        "(`none` shown; swap for `full` / `full_imu` with a fresh logdir):"
+    )
+    st.code(
+        """cd ~/turtlebot-dreamerv3/dreamerv3-torch
+GOALS="2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0"   # stage 4
+
+# default (sparse baseline)
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage4_360_none_seed0_reward_default_fixedgoal \\
+  --stage 4 --lidar 360 --odometry_mode none --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100 \\
+  --reward_mode default --fixed_goals "$GOALS"
+
+# pbrs (potential-based) — same goals, fresh logdir
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage4_360_none_seed0_reward_pbrs_fixedgoal \\
+  --stage 4 --lidar 360 --odometry_mode none --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100 \\
+  --reward_mode pbrs --fixed_goals "$GOALS"
+
+# random order from the set instead of round-robin: add
+#   --fixed_goals_random True""",
+        language="bash",
+    )
+
     st.info(
         "**Eval overhead on long runs:** eval fires every `--eval_every` (default "
         "**20000**) steps, so a 300k run ≈ 16 evals and 600k ≈ 31 evals. At "
@@ -1835,6 +2264,8 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
         ("--pbrs_angle_weight",         "0.2",         "pbrs: weight of heading-alignment term in Φ"),
         ("--pbrs_distance_scale",       "5.0",         "pbrs: distance normaliser (m); fixed, not stage-aware"),
         ("--pbrs_gamma",                "0.997",       "pbrs: discount; keep == agent discount (0.997) for policy invariance"),
+        ("--fixed_goals",               "''",          "'' = random goals (default). 'x1,y1;x2,y2;…' = fixed set; any stage 1–8; composes with any --odometry_mode / --reward_mode"),
+        ("--fixed_goals_random",        "False",       "fixed-goal order: False = round-robin through the set (default); True = random pick each episode"),
         ("--prefill",                   "500",         "random steps before training (once)"),
         ("--time_limit",                "250",         "max steps per episode before timeout"),
         ("--resource_logging",          "true",        "CPU/RAM/GPU logging (False to disable)"),
@@ -1897,16 +2328,40 @@ def main():
         PLOTS_DIR = PLOTS_BASE if folder == "." else PLOTS_BASE / folder
 
         all_runs = scan_runs()
+        run_opts = []
         if not all_runs:
-            st.error(f"No CSV files found in:\n`{CSV_DIR}`")
-            st.stop()
-        st.caption(f"{len(all_runs)} run(s) detected")
+            # Non-fatal: keep the app alive so the 📖 Commands tab stays reachable
+            # even when this folder has no CSVs (don't st.stop()).
+            st.warning("No CSV files in this folder — pick another, "
+                       "or open the 📖 Commands tab.")
+        else:
+            st.caption(f"{len(all_runs)} run(s) detected")
+            # Phase filter — training runs vs their eval_* variants (eval CSVs surface
+            # as eval_{run} run names). Filters the run list so training and eval don't
+            # mix on one chart unless you choose Both. Applies to every tab.
+            phase_view = st.radio(
+                "Phase", ["Both", "Training", "Eval"],
+                horizontal=True, key="sidebar_phase",
+                help="Training = the blackbox_*/planning_* runs.  Eval = their "
+                     "eval_* variants (evaluation checkpoints).  Both = show all "
+                     "(train and eval mixed on the chart).",
+            )
+            if phase_view == "Training":
+                run_opts = [r for r in all_runs if not r.startswith("eval_")]
+            elif phase_view == "Eval":
+                run_opts = [r for r in all_runs if r.startswith("eval_")]
+            else:
+                run_opts = all_runs
+            if not run_opts:
+                st.caption(f"*No {phase_view.lower()} runs in this folder.*")
 
         selected = st.multiselect(
             "Select runs",
-            options=all_runs,
-            default=all_runs[:min(2, len(all_runs))],
-            help="Tip: select multiple runs to compare them on the same chart",
+            options=run_opts,
+            default=run_opts[:min(2, len(run_opts))],
+            key="run_multiselect",
+            help="Tip: select multiple runs to compare them on the same chart. "
+                 "Use the Phase filter above to show only training or only eval runs.",
         )
 
         st.divider()
@@ -1928,14 +2383,12 @@ def main():
         st.divider()
         st.caption(f"CSVs: `{CSV_DIR}`\nPlots: `{PLOTS_DIR}`")
 
-    # ── Guard ────────────────────────────────────────────────────────────────
-    if not selected:
-        st.info("← Select one or more runs from the sidebar.")
-        st.stop()
-
     # ── Load data ────────────────────────────────────────────────────────────
+    # No global st.stop() when nothing is selected — the 📖 Commands tab must stay
+    # reachable. Data-dependent tabs below show a "select a run" hint instead.
     bb_data = {r: load_bb(r) for r in selected}
     wb_data = {r: load_wb(r) for r in selected}
+    _NO_RUN_MSG = "← Select one or more runs from the sidebar to see this tab."
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
     tab_ov, tab_bb, tab_wb, tab_pl, tab_res, tab_bo, tab_cmp, tab_conv, tab_run = st.tabs([
@@ -1945,19 +2398,37 @@ def main():
     ])
 
     with tab_ov:
-        _section_summary(selected, bb_data, wb_data)
-        st.divider()
-        _section_comparison(selected, bb_data, wb_data)
+        if not selected:
+            st.info(_NO_RUN_MSG)
+        else:
+            _section_summary(selected, bb_data, wb_data)
+            st.divider()
+            _section_comparison(selected, bb_data, wb_data)
+            st.divider()
+            n_per_ckpt = st.number_input(
+                "Episodes per eval checkpoint (match --eval_episode_num)",
+                min_value=1, max_value=500, value=100, step=10,
+                key="ov_eval_ckpt_n",
+                help="Set this to the --eval_episode_num used in your run (default 100). "
+                     "Each block of this many eval episodes = one checkpoint.",
+            )
+            _section_eval_checkpoints(selected, int(n_per_ckpt))
 
     with tab_bb:
-        _section_bb(selected, bb_data, show_cumulative, show_r100, show_r500)
+        if not selected:
+            st.info(_NO_RUN_MSG)
+        else:
+            _section_bb(selected, bb_data, show_cumulative, show_r100, show_r500)
 
     with tab_wb:
-        _section_wb(selected, wb_data)
+        if not selected:
+            st.info(_NO_RUN_MSG)
+        else:
+            _section_wb(selected, wb_data)
 
     with tab_pl:
         if len(selected) == 0:
-            st.info("← Select a run in the sidebar.")
+            st.info(_NO_RUN_MSG)
         elif len(selected) == 1:
             rn = selected[0]
             _section_planner(rn, load_pl(rn), load_bb(rn))
@@ -1968,7 +2439,9 @@ def main():
                 st.divider()
 
     with tab_res:
-        if len(selected) == 1:
+        if not selected:
+            st.info(_NO_RUN_MSG)
+        elif len(selected) == 1:
             rn = selected[0]
             _section_resource(rn, load_resource(rn), load_resource_eval(rn))
         else:

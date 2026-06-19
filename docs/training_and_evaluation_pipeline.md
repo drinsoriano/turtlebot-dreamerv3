@@ -108,6 +108,17 @@ unchanged and **adds** four per-step terms:
 In `default` mode these terms are all zero, so the reward is exactly the original
 sparse signal.
 
+**Potential-based shaping** (`reward_mode = pbrs`) instead adds one term,
+`pbrs_scale * (pbrs_gamma * Phi(s') - Phi(s))`, with
+`Phi(s) = -(pbrs_distance_weight * d_norm + pbrs_angle_weight * a_norm)` built from
+the relative goal distance/angle already in the observation. With `pbrs_gamma` equal
+to the agent discount (0.997) it is **policy-invariant** (Ng, Harada and Russell,
+1999) — it changes learning dynamics, not the optimal policy — and it does not use
+A\* nor the four `shaped` terms. All shaping happens inside `get_reward_and_done`;
+the agent, observation space, and action space are unchanged. See
+[reward_shaping.md](reward_shaping.md) for the data-flow diagram and the five
+`pbrs_*` knobs.
+
 ### 6. Evaluation protocol
 On its periodic schedule the loop runs a fixed number of evaluation episodes
 (`eval_episode_num`, default 100) on the **evaluation** environment using the

@@ -383,3 +383,133 @@ def get_grid(stage: int) -> tuple[np.ndarray, dict]:
     if stage not in _GRID_CACHE:
         _GRID_CACHE[stage] = build_grid(stage)
     return _GRID_CACHE[stage]
+
+
+# ── Nonholonomic (Dubins-to-point) reference ───────────────────────────────────
+# A curvature-bounded reference path that respects the robot's minimum turning
+# radius, unlike the holonomic grid A* above. Used as a *fair* denominator for the
+# path-efficiency metric. This is an independent closed-form curve — it does NOT
+# use A*; the only shared input is get_grid(), and only for the collision check.
+
+
+def is_occupied(grid: np.ndarray, arena: dict, x: float, y: float,
+                resolution: float = RESOLUTION) -> bool:
+    """True if world point (x, y) falls on an occupied (already ROBOT_RADIUS-inflated)
+    cell or outside the arena. Uses the same round-to-cell convention as astar_plan,
+    so a point-check on the inflated grid is equivalent to a footprint-check."""
+    h_cells, w_cells = grid.shape
+    ix = int(round((x - arena['x_min']) / resolution))
+    iy = int(round((y - arena['y_min']) / resolution))
+    if not (0 <= iy < h_cells and 0 <= ix < w_cells):
+        return True
+    return bool(grid[iy, ix])
+
+
+def _norm_angle(a: float) -> float:
+    """Wrap angle to (-pi, pi]."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _poly_len(pts: list[tuple[float, float]]) -> float:
+    return sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+               for i in range(len(pts) - 1))
+
+
+def _dubins_cs_path(start_xyt: tuple[float, float, float],
+                    goal_xy: tuple[float, float],
+                    radius: float,
+                    resolution: float = RESOLUTION) -> tuple:
+    """Shortest **curve-then-straight (C·S)** bounded-curvature path from a directed
+    start pose to a goal *point* with **free final heading**.
+
+    Optimal Dubins solution to a point (free orientation) when the goal lies outside
+    both radius-`r` turning circles tangent to the start pose. Returns
+    (length_metres, waypoints) sampled at ~`resolution`, or (None, []) if the goal is
+    inside both circles (degenerate — only at sub-radius range).
+    """
+    x0, y0, th0 = start_xyt
+    gx, gy = goal_xy
+    best = None  # (total_len, center, s, phi_start, phi_td, arc, straight_len)
+
+    for s in (+1.0, -1.0):  # +1 = left / CCW circle, -1 = right / CW circle
+        cx = x0 - s * radius * math.sin(th0)
+        cy = y0 + s * radius * math.cos(th0)
+        d = math.hypot(gx - cx, gy - cy)
+        if d < radius:                       # goal inside this circle → no C·S
+            continue
+        alpha = math.atan2(gy - cy, gx - cx)
+        gamma = math.acos(max(-1.0, min(1.0, radius / d)))
+        phi_start = math.atan2(y0 - cy, x0 - cx)
+        straight_len = math.sqrt(max(0.0, d * d - radius * radius))
+        for phi_td in (alpha + gamma, alpha - gamma):
+            tdx = cx + radius * math.cos(phi_td)
+            tdy = cy + radius * math.sin(phi_td)
+            heading_td = phi_td + s * (math.pi / 2.0)        # tangent heading, dir s
+            dir_tdg = math.atan2(gy - tdy, gx - tdx)
+            if abs(_norm_angle(heading_td - dir_tdg)) > 1e-3:  # not forward-consistent
+                continue
+            arc = (s * (phi_td - phi_start)) % (2 * math.pi)   # swept angle in dir s
+            if arc > 2 * math.pi - 1e-9:                       # ~2π from float wrap → 0
+                arc = 0.0
+            total = radius * arc + straight_len
+            if best is None or total < best[0]:
+                best = (total, (cx, cy), s, phi_start, phi_td, arc, straight_len)
+
+    if best is None:
+        return None, []
+
+    total, (cx, cy), s, phi_start, phi_td, arc, straight_len = best
+    wp: list[tuple[float, float]] = []
+    n_arc = max(1, int(math.ceil(arc * radius / resolution)))
+    for i in range(n_arc + 1):
+        phi = phi_start + s * arc * (i / n_arc)
+        wp.append((cx + radius * math.cos(phi), cy + radius * math.sin(phi)))
+    tdx = cx + radius * math.cos(phi_td)
+    tdy = cy + radius * math.sin(phi_td)
+    n_str = max(1, int(math.ceil(straight_len / resolution)))
+    for i in range(1, n_str + 1):
+        t = i / n_str
+        wp.append((tdx + (gx - tdx) * t, tdy + (gy - tdy) * t))
+    return total, wp
+
+
+def dubins_point_length(start_xyt: tuple[float, float, float],
+                        goal_xy: tuple[float, float],
+                        radius: float) -> float | None:
+    """Length (metres) of the C·S Dubins-to-point path; None if degenerate. See
+    _dubins_cs_path()."""
+    length, _ = _dubins_cs_path(start_xyt, goal_xy, radius)
+    return length
+
+
+def dubins_plan(grid: np.ndarray, arena: dict,
+                start_xyt: tuple[float, float, float],
+                goal_xy: tuple[float, float],
+                radius: float,
+                reach_threshold: float = 0.4,
+                resolution: float = RESOLUTION) -> tuple:
+    """Curvature-bounded reference to the goal *region* (stops at `reach_threshold`,
+    matching the success condition), collision-checked against the inflated grid.
+
+    Returns (length_metres, waypoints, status). status:
+      'ok'            — valid, collision-free curve to the region boundary
+      'dubins_blocked'— the curve crosses an inflated obstacle (honest blank)
+      'no_path'       — degenerate (goal within radius of the start circles)
+      'planner_error' — unexpected exception
+    Numeric length is meaningful only for status == 'ok'.
+    """
+    try:
+        total, wp = _dubins_cs_path(start_xyt, goal_xy, radius, resolution)
+        if total is None or not wp:
+            return None, [], 'no_path'
+        gx, gy = goal_xy
+        # Region semantics: drop the trailing samples inside the acceptance circle.
+        trimmed = [p for p in wp if math.hypot(p[0] - gx, p[1] - gy) > reach_threshold]
+        if not trimmed:
+            trimmed = wp[:1]
+        for (px, py) in trimmed:
+            if is_occupied(grid, arena, px, py, resolution):
+                return None, trimmed, 'dubins_blocked'
+        return _poly_len(trimmed), trimmed, 'ok'
+    except Exception:
+        return None, [], 'planner_error'

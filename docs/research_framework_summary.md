@@ -102,7 +102,7 @@ See [observation_and_action_space.md](observation_and_action_space.md).
 | Variable type | Variable | Operational definition |
 |---|---|---|
 | Independent | Arena stage | Stage 1 to 8 (arena size and obstacle layout), `--stage`. |
-| Independent | Reward mode | `default` sparse or `shaped` additive reward. |
+| Independent | Reward mode | `default` sparse, `shaped` additive, or `pbrs` potential-based (policy-invariant) reward. |
 | Independent | Observation mode | Odometry ablation `none`, `twist`, `delta`, `full`, `full_imu` (`full_imu` = `full` + 2-D `/imu` linear acceleration). |
 | Independent | LiDAR resolution / seed | Beam count (`lidar`) and random `seed`. |
 | Independent (outer loop) | Shaped-reward weights | Five weights tuned by Optuna, external to the agent. |
@@ -132,9 +132,10 @@ is a coarser secondary measure. See
 - **In scope:** the DreamerV3 navigation agent and its ROS2/Gazebo environment,
   observation/action construction, reward/termination, world-model and
   actor-critic learning, replay, logging, evaluation, and the dashboard.
-- **Optional extensions (current branch):** additive reward shaping and an
-  Optuna Bayesian-optimisation search over the shaping weights. These do not
-  change the agent, observation space, or action space.
+- **Optional extensions (current branch):** additive (`shaped`) reward shaping with
+  an Optuna Bayesian-optimisation search over its weights, and a potential-based
+  (`pbrs`), policy-invariant reward shaping. These are reward-only and do not change
+  the agent, observation space, or action space.
 - **Out of scope / excluded:** the legacy model-free implementations (TD3, DDPG,
   SAC) under `model_free/` and the associated root-level scripts. These are not
   components, baselines, or comparison algorithms in this framework. The Gazebo
@@ -149,9 +150,9 @@ study intent — confirm before finalising thesis text:
    prerequisites (launch files, world files, outer-wall and obstacle SDFs, A*
    arena geometry, robot reset, collision/timeout logic) were already in place.
    **Effective supported training and evaluation stages are 1–8.**
-2. **Reward shaping and tuning.** Whether the shaped reward and the Bayesian
-   weight search should be presented as a core contribution or as an optional
-   extension of the baseline DreamerV3 study.
+2. **Reward shaping and tuning.** Whether the shaped/PBRS reward modes and the
+   Bayesian weight search should be presented as a core contribution or as an
+   optional extension of the baseline DreamerV3 study.
 3. **Odometry ablation.** Whether the optional odometry observation modes
    (twist/delta/full/full_imu) are part of the current thesis scope or a separate study.
 4. **Episode horizon.** The configured per-episode step limit and action-repeat

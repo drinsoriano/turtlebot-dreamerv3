@@ -18,6 +18,37 @@ top of it. The mode is grounded in
 | `shaped` | `default` **+** four additive hand-weighted terms (RS-1…RS-4) |
 | `pbrs` | `default` **+** one potential-based shaping term (policy-invariant) |
 
+### Where each mode plugs in (data flow)
+
+All three modes differ at **exactly one place** — the per-step reward computed inside the
+environment (`get_reward_and_done` in `envs/turtle.py`). The **terminal** reward is identical in
+every mode; only the additive term changes. Nothing downstream changes: the DreamerV3 agent, the
+observation space, and the action space are byte-for-byte the same in all three modes. A\* is **not**
+in this path — it is computed afterwards for the metric only.
+
+```mermaid
+flowchart TD
+    subgraph ENV["Environment — envs/turtle.py  (the ONLY place the reward modes differ)"]
+        STEP["Env.step(action)"] --> STATE["get_state():<br/>observation + relative goal distance and angle"]
+        STATE --> GRD["get_reward_and_done()"]
+        GRD --> TERM["Terminal reward — SAME in all modes:<br/>+100 goal / -10 collision / -10 timeout / 0 otherwise"]
+        TERM --> MODE{"reward_mode ?"}
+        MODE -->|"default<br/>(sparse baseline)"| RD["reward = terminal<br/>(no shaping)"]
+        MODE -->|"shaped"| RS["reward = terminal<br/>+ progress + step + turn + near_obstacle<br/>(RS-1..RS-4, hand-weighted)"]
+        MODE -->|"pbrs"| RP["reward = terminal<br/>+ pbrs_scale * (gamma*Phi(s') - Phi(s))<br/>(potential-based, policy-invariant)"]
+        RD --> R(["reward (single scalar)"])
+        RS --> R
+        RP --> R
+    end
+    R -->|"reward + observation"| AGENT["DreamerV3 agent (models.py / networks.py):<br/>RSSM, encoder, decoder, reward head, actor, critic<br/>IDENTICAL for all 3 modes — PBRS does NOT touch it"]
+    ASTAR["A* planner (stage_map.py)"] -.->|"post-hoc metric only —<br/>NEVER fed into the reward"| PL["planning_*.csv"]
+```
+
+> **`reward_mode` is not `odometry_mode`.** The "baseline" here is `--reward_mode default` (sparse,
+> no shaping). It is unrelated to `--odometry_mode none` (which is about the *observation* space).
+> A typical baseline run is `--reward_mode default --odometry_mode none`, but the two flags are
+> independent — PBRS works under any odometry mode.
+
 ---
 
 ## 1. `default` — the original sparse reward

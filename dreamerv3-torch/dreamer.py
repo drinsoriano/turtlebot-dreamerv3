@@ -172,6 +172,8 @@ def make_env(config, mode, id):
         pbrs_angle_weight=config.pbrs_angle_weight,
         pbrs_distance_scale=config.pbrs_distance_scale,
         pbrs_gamma=config.pbrs_gamma,
+        fixed_goals=config.fixed_goals,
+        fixed_goals_random=config.fixed_goals_random,
         csv_dir=config.csv_dir,
         plots_dir=config.plots_dir,
     )

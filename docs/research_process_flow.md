@@ -115,12 +115,18 @@ The recorded CSVs are analysed — interactively through the Streamlit dashboard
 directness, A\* path efficiency, returns, and compute cost.
 
 ### 12. Optional reward shaping and tuning
-On the current branch the sparse reward can optionally be augmented with
-additive shaping terms (progress, step, turning, and near-obstacle penalties),
-and a standalone Optuna Bayesian-optimisation script (`tune_reward.py`) searches
-the shaping weights to improve A\* path efficiency subject to not regressing
-success rate. This is an **optional research extension**; the agent, observation
-space, and action space are unchanged by it.
+On the current branch the sparse reward can optionally be augmented in one of two
+ways. The first is **additive `shaped`** shaping — hand-weighted progress, step,
+turning, and near-obstacle penalties — whose weights a standalone Optuna
+Bayesian-optimisation script (`tune_reward.py`) searches to improve A\* path
+efficiency subject to not regressing success rate. The second is **potential-based
+`pbrs`** shaping — a single term `pbrs_scale·(γ·Φ(s') − Φ(s))` built from the
+relative goal distance/angle — which is **policy-invariant** (with `pbrs_gamma`
+equal to the agent discount) and so changes only the learning dynamics, not the
+optimal policy. Both are **optional research extensions** applied entirely inside
+the environment's reward computation; the agent, observation space, and action
+space are unchanged by them, and A\* is never fed into the reward. See
+[reward_shaping.md](reward_shaping.md) for the data-flow diagram.
 
 ## Training flow versus evaluation flow
 

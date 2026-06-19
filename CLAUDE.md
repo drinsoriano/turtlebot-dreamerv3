@@ -302,7 +302,7 @@ PNG overhead plots are generated per episode under `dreamerv3-torch/path_plots/{
 
 **Filename pattern:** `ep{episode:05d}_{outcome}.png` (e.g. `ep00001_timeout.png`, `ep00042_success.png`)
 /
-` DFT6YGHJJKL;P[]
+`
 **+-Generated whenever:** A* returns a valid path and the episode ends (success / collision / timeout). No toggle flag — always on. Disable during long training runs if I/O becomes a bottleneck.
 
 **Each plot shows:**
