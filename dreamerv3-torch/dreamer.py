@@ -174,6 +174,8 @@ def make_env(config, mode, id):
         pbrs_gamma=config.pbrs_gamma,
         fixed_goals=config.fixed_goals,
         fixed_goals_random=config.fixed_goals_random,
+        max_linear_vel=config.max_linear_vel,
+        max_angular_vel=config.max_angular_vel,
         csv_dir=config.csv_dir,
         plots_dir=config.plots_dir,
     )
@@ -185,6 +187,11 @@ def main(config):
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
+    # Exploration override (Part C / BO lever): when --actor_entropy >= 0, override the
+    # nested actor.entropy coefficient before the agent is built. Sentinel -1.0 = leave
+    # the config default (3e-4) untouched. config.actor is a mutable dict on the namespace.
+    if getattr(config, "actor_entropy", -1.0) >= 0:
+        config.actor["entropy"] = config.actor_entropy
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"

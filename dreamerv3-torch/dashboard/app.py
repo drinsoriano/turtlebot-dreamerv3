@@ -293,6 +293,31 @@ def _success_mask(df: pd.DataFrame):
     return df["steps_to_goal"] != -1
 
 
+# ─── Perf helpers: row-capped tables + chart-trace downsampling ───────────────
+# Neither changes any metric/formula — purely how much is shipped to the browser.
+
+def _capped_table(df: pd.DataFrame, key: str, default_n: int = 50) -> pd.DataFrame:
+    """Show only the last `default_n` rows by default; a checkbox opts into the
+    full table. Caller must reuse the RETURNED frame for any positional (.iloc)
+    follow-up logic (e.g. click-to-select), not the original df — the returned
+    frame is what's actually rendered."""
+    if len(df) <= default_n:
+        return df
+    show_full = st.checkbox(
+        f"Show full table ({len(df)} rows)", value=False, key=f"{key}_full",
+    )
+    return df if show_full else df.tail(default_n)
+
+
+def _thin(df: pd.DataFrame, max_points: int = 2000) -> pd.DataFrame:
+    """Stride-sample a raw scatter/marker trace above max_points so large runs
+    (thousands of episodes) don't ship one point per row to the browser. Only
+    ever applied to raw traces — rolling-mean lines are computed on the full
+    series first, then thinned the same way, so trend shape is unaffected."""
+    n = len(df)
+    return df.iloc[:: max(1, n // max_points)] if n > max_points else df
+
+
 def _convergence_point(values: pd.Series, tol: float, tail_frac: float = 0.25):
     """Earliest index where the (already-rolled) series enters and STAYS within
     ±tol of the plateau (median of the last tail_frac of the series).
@@ -350,6 +375,7 @@ def _bb_chart(
             d = df
         if d.empty:
             continue
+        d = _thin(d)  # long runs (thousands of episodes) ship fewer points to the browser
         clr = _clr(i)
         if show_cumulative:
             fig.add_trace(go.Scatter(
@@ -442,6 +468,7 @@ def _resource_chart(
     phases = sub["_phase"].unique().tolist() if has_phase else [None]
     for i, ph in enumerate(phases):
         part = sub[sub["_phase"] == ph] if ph is not None else sub
+        part = _thin(part)  # long runs ship fewer points to the browser
         label = f"{y_col} ({ph})" if ph else y_col
         fig.add_trace(go.Scatter(
             x=part[x_col], y=part[y_col], mode="lines",
@@ -660,14 +687,32 @@ def _section_bb(selected: list, bb_data: dict, show_cumulative: bool, show_r100:
         "`steps_to_goal` is the step count for **successful** episodes only "
         "(−1 for collision / timeout). Click a column header to sort."
     )
+    exclude_invalid = st.checkbox(
+        "Exclude non-terminal / hang-affected rows",
+        value=False, key="bb_exclude_invalid",
+        help="Drops rows with an unrecognised outcome or episode_steps <= 0 — a "
+             "belt-and-suspenders filter for logging affected by a mid-episode hang. "
+             "Off by default so no data is hidden without asking.",
+    )
     for run in selected:
         df = run_map.get(run)
         if df is None or df.empty:
             st.caption(f"*{run} — no black-box data*")
             continue
+        if exclude_invalid:
+            mask = pd.Series(True, index=df.index)
+            if "outcome" in df.columns:
+                mask &= df["outcome"].isin(["success", "collision", "timeout"])
+            if "episode_steps" in df.columns:
+                mask &= pd.to_numeric(df["episode_steps"], errors="coerce").fillna(0) > 0
+            df = df[mask]
+            if df.empty:
+                st.caption(f"*{run} — no rows left after excluding invalid ones*")
+                continue
         if len(selected) > 1:
             st.markdown(f"**{run}**")
         show = df.drop(columns=[c for c in ["_idx"] if c in df.columns])
+        show = _capped_table(show, key=f"bb_tbl_{run}")
         # Styler (outcome coloring) is fine for modest logs; for very long runs
         # fall back to a plain frame to keep rendering snappy.
         use_style = "outcome" in show.columns and len(show) <= 1500
@@ -866,22 +911,26 @@ def _section_resource(run_name: str, res_df: pd.DataFrame, res_eval_df: pd.DataF
         display_df = df.drop(columns=["_phase"], errors="ignore").copy()
         for col in display_df.select_dtypes(include="object").columns:
             display_df[col] = display_df[col].astype(str)
-        st.dataframe(display_df, width="stretch", key=f"res_raw_{run_name}")
+        display_df = _capped_table(display_df, key=f"res_raw_{run_name}")
+        st.dataframe(display_df, width="stretch", key=f"res_raw_tbl_{run_name}")
 
 
 # Per-goal drill-down metrics: label -> (source, column). "_success01" is derived
 # on the fly from outcome (its rolling mean = the per-goal success rate over time).
 _GOAL_METRICS = {
-    "Path Efficiency":        ("planning", "planner_path_efficiency"),
+    "Path Efficiency (Hybrid-A*)": ("planning", "planner_path_efficiency_hybrid"),
+    "Path Efficiency (A*)":   ("planning", "planner_path_efficiency"),
     "Success (per episode)":  ("blackbox", "_success01"),
     "Actual Path Length (m)": ("planning", "actual_path_length"),
     "Episode Steps":          ("blackbox", "episode_steps"),
     "Path Directness":        ("blackbox", "path_directness"),
+    "Local Efficiency":       ("blackbox", "local_efficiency"),
     "Min Obstacle Dist (m)":  ("blackbox", "min_obstacle_dist"),
     "Near Collisions":        ("blackbox", "near_collisions"),
 }
 # Metrics bounded to [0, 1] — fix the y-axis for these so trends are comparable.
-_GOAL_METRICS_UNIT = {"planner_path_efficiency", "_success01", "path_directness"}
+_GOAL_METRICS_UNIT = {"planner_path_efficiency_hybrid", "planner_path_efficiency",
+                      "_success01", "path_directness"}
 
 
 def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame,
@@ -1061,6 +1110,21 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             if "planner_path_efficiency_center_raw" in pl_df.columns else 0
         d5.metric("Raw > 1.0 (centre)", str(cen_raw_over_1))
 
+    if "planner_path_efficiency_hybrid" in pl_df.columns:
+        ok_hyb_mask = pl_df["planner_status_hybrid"] == "ok"
+        ok_hyb_df   = pl_df[ok_hyb_mask]
+        suc_hyb_mask = ok_hyb_mask & (pl_df["outcome"] == "success")
+        st.caption("**Hybrid-A\\* metric** — nonholonomic + obstacle-aware (fair denominator; primary)")
+        h1, h2, h3, h4, h5 = st.columns(5)
+        h1.metric("Mean (hybrid)",   _fmt(_mean(ok_hyb_df,   "planner_path_efficiency_hybrid"), 3))
+        h2.metric("Median (hybrid)", _fmt(_median(ok_hyb_df, "planner_path_efficiency_hybrid"), 3))
+        h3.metric("Success-only (hybrid)",
+                  _fmt(_mean(pl_df[suc_hyb_mask], "planner_path_efficiency_hybrid"), 3))
+        h4.metric("Hybrid No-path", str(int((pl_df["planner_status_hybrid"] != "ok").sum())))
+        hyb_raw_over_1 = int((pl_df["planner_path_efficiency_hybrid_raw"].dropna() > 1.0).sum()) \
+            if "planner_path_efficiency_hybrid_raw" in pl_df.columns else 0
+        h5.metric("Raw > 1.0 (hybrid)", str(hyb_raw_over_1))
+
     # ── Planner status breakdown ──────────────────────────────────────────────
     with st.expander("Planner status breakdown", expanded=False):
         status_counts = pl_df["planner_status"].value_counts().reset_index()
@@ -1072,20 +1136,33 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     st.subheader("Planner Path Efficiency vs Episode")
     roll_window = st.slider("Rolling average window", 5, 100, 25, key=f"roll_{run_name}")
 
+    # Success-only view: paper-grade filtering — efficiency/directness claims should
+    # be made on successful episodes only (failed episodes mix in truncated paths).
+    success_only = st.checkbox(
+        "Success-only (recommended for reported results)",
+        value=False, key=f"plan_suconly_{run_name}",
+    ) if "outcome" in pl_df.columns else False
+    chart_df = pl_df[pl_df["outcome"] == "success"] if success_only else pl_df
+
     # Per-goal grouping (fixed-goal experiments): one rolling-mean series per goal_id,
     # so you see whether each goal's path tightens over training. Degrades silently
     # on older CSVs without the column.
-    has_goal_id = "goal_id" in pl_df.columns and pl_df["goal_id"].nunique() > 1
+    has_goal_id = "goal_id" in chart_df.columns and chart_df["goal_id"].nunique() > 1
     group_by_goal = False
     if has_goal_id:
         group_by_goal = st.checkbox(
-            f"Group by goal_id ({pl_df['goal_id'].nunique()} goals) — one rolling series per goal",
+            f"Group by goal_id ({chart_df['goal_id'].nunique()} goals) — one rolling series per goal",
             value=False, key=f"plan_goalgrp_{run_name}",
         )
 
+    # Raw marker traces are thinned above max_points; rolling means below are
+    # always computed on the FULL chart_df first (so the rolling window keeps
+    # its real meaning), only the marker scatter itself ships fewer points.
+    raw_view = _thin(chart_df)
+
     fig = go.Figure()
     if group_by_goal:
-        for i, (gid, g) in enumerate(pl_df.groupby("goal_id")):
+        for i, (gid, g) in enumerate(chart_df.groupby("goal_id")):
             ok = g[g["planner_status"] == "ok"] if "planner_status" in g.columns else g
             if ok.empty or "planner_path_efficiency" not in ok.columns:
                 continue
@@ -1096,41 +1173,59 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
                 marker=dict(size=3), line=dict(width=1.6, color=_clr(i)),
                 connectgaps=False,
             ))
-    elif "episode" in pl_df.columns and "planner_path_efficiency" in pl_df.columns:
+    elif "episode" in chart_df.columns and "planner_path_efficiency" in chart_df.columns:
         fig.add_trace(go.Scatter(
-            x=pl_df["episode"],
-            y=pl_df["planner_path_efficiency"],
+            x=raw_view["episode"],
+            y=raw_view["planner_path_efficiency"],
             mode="lines+markers",
             name="Efficiency (region)",
             marker=dict(size=3),
             line=dict(width=1, color=PALETTE[0]),
             connectgaps=False,
         ))
-        rolled = pl_df["planner_path_efficiency"].rolling(roll_window, min_periods=1).mean()
+        rolled = chart_df["planner_path_efficiency"].rolling(roll_window, min_periods=1).mean()
         fig.add_trace(go.Scatter(
-            x=pl_df["episode"],
+            x=chart_df["episode"],
             y=rolled,
             mode="lines",
             name=f"Rolling {roll_window} (region)",
             line=dict(width=2, color=PALETTE[0], dash="dash"),
         ))
-    if not group_by_goal and "planner_path_efficiency_center" in pl_df.columns:
+    if not group_by_goal and "planner_path_efficiency_center" in chart_df.columns:
         fig.add_trace(go.Scatter(
-            x=pl_df["episode"],
-            y=pl_df["planner_path_efficiency_center"],
+            x=raw_view["episode"],
+            y=raw_view["planner_path_efficiency_center"],
             mode="lines+markers",
             name="Efficiency (centre)",
             marker=dict(size=3),
             line=dict(width=1, color="#9467bd"),
             connectgaps=False,
         ))
-        rolled_cen = pl_df["planner_path_efficiency_center"].rolling(roll_window, min_periods=1).mean()
+        rolled_cen = chart_df["planner_path_efficiency_center"].rolling(roll_window, min_periods=1).mean()
         fig.add_trace(go.Scatter(
-            x=pl_df["episode"],
+            x=chart_df["episode"],
             y=rolled_cen,
             mode="lines",
             name=f"Rolling {roll_window} (centre)",
             line=dict(width=2, color="#9467bd", dash="dot"),
+        ))
+    if not group_by_goal and "planner_path_efficiency_hybrid" in chart_df.columns:
+        fig.add_trace(go.Scatter(
+            x=raw_view["episode"],
+            y=raw_view["planner_path_efficiency_hybrid"],
+            mode="lines+markers",
+            name="Efficiency (Hybrid-A*)",
+            marker=dict(size=3),
+            line=dict(width=1, color="#17becf"),
+            connectgaps=False,
+        ))
+        rolled_hyb = chart_df["planner_path_efficiency_hybrid"].rolling(roll_window, min_periods=1).mean()
+        fig.add_trace(go.Scatter(
+            x=chart_df["episode"],
+            y=rolled_hyb,
+            mode="lines",
+            name=f"Rolling {roll_window} (Hybrid-A*)",
+            line=dict(width=2.4, color="#17becf", dash="dash"),
         ))
     fig.update_layout(
         xaxis_title="Episode", yaxis_title="Efficiency",
@@ -1148,18 +1243,32 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     st.subheader("Planning Log  —  click a row to view its path plot")
     display_cols = [c for c in [
         "episode", "outcome", "goal_id",
+        "planner_status_hybrid", "planner_path_efficiency_hybrid", "planner_path_efficiency_hybrid_raw",
         "planner_status", "planner_path_efficiency", "planner_path_efficiency_raw",
         "planner_status_center", "planner_path_efficiency_center", "planner_path_efficiency_center_raw",
         "initial_distance", "actual_path_length",
-        "planned_path_length", "planned_path_length_center",
+        "planned_path_length", "planned_path_length_center", "planned_path_length_hybrid",
     ] if c in pl_df.columns]
 
     selected_ep = None
     outcome_val = ""
 
+    exclude_bad_planner = st.checkbox(
+        "Exclude non-ok planner rows (no_path / planner_error / …)",
+        value=False, key=f"plan_exclude_invalid_{run_name}",
+        help="Off by default. planner_status != 'ok' rows have blank efficiency "
+             "by design (see CLAUDE.md) — this just hides them from the table.",
+    ) if "planner_status" in pl_df.columns else False
+    log_df = pl_df[pl_df["planner_status"] == "ok"] if exclude_bad_planner else pl_df
+
+    # Row cap applied BEFORE display — the click handler below must resolve
+    # row_idx against this SAME frame (table_df), since Streamlit's on_select
+    # returns a position within whatever was actually rendered, not pl_df.
+    table_df = _capped_table(log_df[display_cols], key=f"plan_table_{run_name}")
+
     try:
         subset = ["outcome"] if "outcome" in display_cols else None
-        base = pl_df[display_cols].style
+        base = table_df.style
         if subset:
             try:
                 styled = base.map(_color_outcome_text, subset=subset)
@@ -1169,11 +1278,11 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             styled = base
         event = st.dataframe(
             styled, width="stretch",
-            key=f"plan_table_{run_name}",
+            key=f"plan_table_render_{run_name}",
             on_select="rerun", selection_mode="single-row",
         )
     except Exception:
-        display_pl = pl_df[display_cols].copy()
+        display_pl = table_df.copy()
         for col in display_pl.select_dtypes(include="object").columns:
             display_pl[col] = display_pl[col].astype(str)
         event = st.dataframe(
@@ -1182,12 +1291,13 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             on_select="rerun", selection_mode="single-row",
         )
 
-    # Resolve selected episode from the clicked row
+    # Resolve selected episode from the clicked row — positional into table_df
+    # (the rendered frame), NOT pl_df.
     sel_rows = getattr(getattr(event, "selection", None), "rows", [])
     if sel_rows:
         row_idx = sel_rows[0]
-        if 0 <= row_idx < len(pl_df):
-            clicked = pl_df[display_cols].iloc[row_idx]
+        if 0 <= row_idx < len(table_df):
+            clicked = table_df.iloc[row_idx]
             if "episode" in clicked.index:
                 selected_ep = int(clicked["episode"])
             if "outcome" in clicked.index:
@@ -1251,9 +1361,11 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
                 st.caption("No blackbox CSV for this run.")
 
 
+# BO-searched flags (emitted verbatim as --{key}). actor_entropy is a top-level flag
+# (not --reward_*), so it appears in the leaderboard and validation command too.
 _BO_REWARD_KEYS = [
     "reward_progress_scale", "reward_step_penalty", "reward_turn_penalty",
-    "reward_near_obstacle_scale", "reward_near_obstacle_sigma",
+    "reward_near_obstacle_scale", "reward_near_obstacle_sigma", "actor_entropy",
 ]
 
 
@@ -1399,11 +1511,16 @@ def _section_bo_trials(df: pd.DataFrame):
     # ── Leaderboard table ─────────────────────────────────────────────────────
     st.subheader("Trial Leaderboard")
     st.caption("Feasible trials first, then by efficiency descending.")
+    hide_incomplete = (
+        st.checkbox("Hide incomplete trials (RUNNING / FAIL)", value=True, key="bo_hide_incomplete")
+        if "state" in df.columns else False
+    )
+    board_df = df[df["state"] == "COMPLETE"] if hide_incomplete else df
     display_cols = ["trial", "run_name", "state", "efficiency", "success",
                     "feasible", "constraint", "partial", "n_eff_rows"] + \
-                   [k for k in _BO_REWARD_KEYS if k in df.columns]
-    display_cols = [c for c in display_cols if c in df.columns]
-    disp = df[display_cols].copy()
+                   [k for k in _BO_REWARD_KEYS if k in board_df.columns]
+    display_cols = [c for c in display_cols if c in board_df.columns]
+    disp = board_df[display_cols].copy()
     disp["_sf"] = (~disp["feasible"].fillna(False)).astype(int)
     disp["_se"] = -disp["efficiency"].fillna(float("-inf"))
     disp = disp.sort_values(["_sf", "_se"]).drop(columns=["_sf", "_se"])
@@ -1437,8 +1554,38 @@ def _section_bo_trials(df: pd.DataFrame):
         suc_str = f"{best_suc:.1f}%" if best_suc is not None else "—"
         st.caption(f"Trial {int(best_row['trial'])} ({tag}) | efficiency: {eff_str} | success: {suc_str}")
 
-    # ── Planning Efficiency — Learning Curves ─────────────────────────────────
+    # ── Trial filter — applied BEFORE the per-trial CSV loads below ───────────
+    # The learning-curve sections each load one planning + one blackbox CSV per
+    # trial (~5-6k rows each). With 100+ trials in a study that's hundreds of
+    # multi-thousand-row reads on every rerun unless narrowed first — so filter
+    # the trial list here, against the already-loaded (small) `df`, before any
+    # per-episode file is touched.
     st.divider()
+    st.subheader("Trial data to load")
+    c_f1, c_f2, c_f3 = st.columns([2, 1, 1])
+    with c_f1:
+        state_opts = sorted(df["state"].dropna().unique().tolist()) if "state" in df.columns else []
+        default_states = [s for s in ["COMPLETE"] if s in state_opts] or state_opts
+        sel_states = st.multiselect(
+            "Trial state", state_opts, default=default_states, key="bo_load_states",
+        ) if state_opts else []
+    with c_f2:
+        load_all = st.checkbox("Load all trials", value=False, key="bo_load_all")
+    with c_f3:
+        last_n = st.number_input(
+            "Last N", min_value=1, max_value=max(1, len(df)),
+            value=min(20, max(1, len(df))), step=5,
+            key="bo_load_lastn", disabled=load_all,
+        )
+
+    df_load = df[df["state"].isin(sel_states)] if sel_states else df
+    if not load_all and "trial" in df_load.columns:
+        df_load = df_load.sort_values("trial").tail(int(last_n))
+    st.caption(f"Loading {len(df_load)} of {len(df)} trials below "
+               f"({'all trials' if load_all else f'last {int(last_n)}'}"
+               f"{', state ' + '/'.join(sel_states) if sel_states and sel_states != state_opts else ''}).")
+
+    # ── Planning Efficiency — Learning Curves ─────────────────────────────────
     st.subheader("Planning Efficiency Over Episodes")
     st.caption(
         "One line per trial — how path efficiency evolves as training progresses. "
@@ -1456,9 +1603,9 @@ def _section_bo_trials(df: pd.DataFrame):
     with c_roll:
         roll_bo = st.slider("Rolling window", 3, 50, 15, key="bo_pl_roll")
 
-    # Load planning CSVs for every trial that has one
+    # Load planning CSVs for the FILTERED trial set only (not every trial in the study)
     trial_pl: dict = {}  # trial_num → (pl_df, feasible_bool)
-    for _, row in df.iterrows():
+    for _, row in df_load.iterrows():
         rn = str(row.get("run_name", "")) if pd.notna(row.get("run_name")) else ""
         if not rn:
             continue
@@ -1596,9 +1743,10 @@ def _section_bo_trials(df: pd.DataFrame):
     bb_col = BB_METRIC_OPTIONS[bb_metric_label]
     success_only_bb = bb_col == "steps_to_goal"
 
-    # Load blackbox CSVs for every trial
+    # Load blackbox CSVs for the same FILTERED trial set (df_load, from the
+    # "Trial data to load" filter above) — not every trial in the study.
     trial_bb: dict = {}  # trial_num → (bb_df, feasible_bool)
-    for _, row in df.iterrows():
+    for _, row in df_load.iterrows():
         rn = str(row.get("run_name", "")) if pd.notna(row.get("run_name")) else ""
         if not rn:
             continue
@@ -1937,6 +2085,17 @@ def _section_commands():
         "has a copy button). Replace the `1` / `stage1` parts with your target "
         "stage (1–8) — the running Gazebo stage must match `--stage`."
     )
+    st.warning(
+        "**⚠ NEW kinematics default (branch `path-efficiency-hybrid`):** "
+        "`--max_angular_vel` now defaults to **1.0 rad/s** ⇒ **min turn radius = "
+        "`max_linear_vel/max_angular_vel` = 0.1/1.0 = 0.1 m** (the robot can near-pivot → "
+        "tight paths). The **OLD** setup was **0.2 rad/s** (radius **0.5 m**) — the cause of "
+        "the CCW-looping / low path efficiency. This **changes the default MDP**: new runs "
+        "are **NOT comparable** to old 0.2-rad/s runs. **Pass `--max_angular_vel 0.2`** to "
+        "reproduce the legacy behaviour or resume an old run. Path efficiency is now also "
+        "measured by the fair **Hybrid-A\\*** metric (`planner_path_efficiency_hybrid`, "
+        "nonholonomic + obstacle-aware, never blank) — the **blue** path on every PNG."
+    )
     st.info(
         "**Recent defaults (2026-06-12):**  `eval_every` = **20000** (eval interval "
         "in steps — the old hardcoded `% 4` was removed; lower it for a finer "
@@ -2034,6 +2193,27 @@ python3 dreamer.py --configs turtle --task turtle \\
   --stage 1 --lidar 360 --odometry_mode none --seed 0 \\
   --device cuda --steps 300000 --eval_episode_num 100 \\
   --reward_mode default""",
+        language="bash",
+    )
+    st.markdown(
+        "**Kinematics A/B** (the headline lever) — same everything, vary only "
+        "`--max_angular_vel`: **1.0** (default, radius 0.1 m, capable) vs **0.2** "
+        "(legacy, radius 0.5 m). Fresh logdir each; compare `planner_path_efficiency_hybrid`:"
+    )
+    st.code(
+        """cd ~/turtlebot-dreamerv3/dreamerv3-torch
+# NEW default kinematics (1.0 rad/s) — no flag needed
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage1_360_none_seed0_reward_default_ang10 \\
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100 --reward_mode default
+
+# LEGACY kinematics (0.2 rad/s, radius 0.5 m) — the old looping setup
+python3 dreamer.py --configs turtle --task turtle \\
+  --logdir ./logdir/stage1_360_none_seed0_reward_default_ang02 \\
+  --stage 1 --lidar 360 --odometry_mode none --seed 0 \\
+  --device cuda --steps 300000 --eval_episode_num 100 --reward_mode default \\
+  --max_angular_vel 0.2""",
         language="bash",
     )
     st.markdown("**Shaped reward** (additive shaping, mild defaults):")
@@ -2166,29 +2346,38 @@ python3 dreamer.py --configs turtle --task turtle \\
         "ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py gui:=false",
         language="bash",
     )
-    st.markdown("**Terminal 2 — the tuner** (run the steps in order):")
+    st.markdown(
+        "**Terminal 2 — the tuner** (run the steps in order). The BO now **co-tunes "
+        "`actor_entropy`** (exploration) with the reward weights (step/turn widened to "
+        "0–0.1) and **scores on the fair Hybrid-A\\* efficiency**, on the new 1.0-rad/s "
+        "kinematics. ⚠ **Use a fresh `--study-name`** (e.g. `reward_stage1_none_eff`) — the "
+        "search space changed, so resuming an old study would corrupt its TPE model:"
+    )
     st.code(
         """cd ~/turtlebot-dreamerv3/dreamerv3-torch
 
 # (optional) preview the exact dreamer.py commands — no training, no Gazebo needed
-python3 tune_reward.py --stage 1 --n-trials 2 --dry-run
+python3 tune_reward.py --stage 1 --n-trials 2 --dry-run --study-name reward_stage1_none_eff
 
-# 1) default-reward baseline → sets the success-rate constraint floor
-python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20
+# 1) default-reward baseline → sets the success-rate constraint floor (new kinematics)
+python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20 \\
+  --study-name reward_stage1_none_eff
 
-# 2) the search: 30 trials, each an 80k-step run with Optuna-chosen weights
-python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 20
+# 2) the search: 40 trials, each an 80k-step run; tunes actor_entropy + reward weights
+python3 tune_reward.py --stage 1 --n-trials 40 --steps 80000 --eval-episode-num 20 \\
+  --study-name reward_stage1_none_eff
 
 # tune under a specific obs space (e.g. IMU) — namespaces the study/db/csv by mode:
-python3 tune_reward.py --stage 1 --odometry-mode full_imu --n-trials 30 --steps 80000 --eval-episode-num 20""",
+python3 tune_reward.py --stage 1 --odometry-mode full_imu --n-trials 40 --steps 80000 \\
+  --eval-episode-num 20 --study-name reward_stage1_full_imu_eff""",
         language="bash",
     )
     st.caption(
-        "`--odometry-mode` (default `none`) sets the obs space the weights are tuned under "
-        "and **always** namespaces the study/db/csv/plots by mode (`tune_stage1_none/`, "
-        "`tune_stage1_full_imu/`, …). Resumes automatically — re-run the **same** command "
-        "after a crash/reboot and it continues the study (sqlite `tune_reward_stage1_{mode}.db`, "
-        "e.g. `_none`), not from trial 0. Sanity-test first with "
+        "`--odometry-mode` (default `none`) sets the obs space and **always** namespaces the "
+        "study/db/csv/plots by mode. Resumes automatically — re-run the **same** command "
+        "(same `--study-name`) after a crash/reboot and it continues, not from trial 0. The "
+        "db is keyed by stage+mode (`tune_reward_stage1_none.db`); the `_eff` study lives "
+        "inside it alongside any older study. Sanity-test first with "
         "`--study-name smoke --n-trials 2 --steps 3000 --eval-episode-num 2`."
     )
 
@@ -2266,6 +2455,9 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
         ("--pbrs_gamma",                "0.997",       "pbrs: discount; keep == agent discount (0.997) for policy invariance"),
         ("--fixed_goals",               "''",          "'' = random goals (default). 'x1,y1;x2,y2;…' = fixed set; any stage 1–8; composes with any --odometry_mode / --reward_mode"),
         ("--fixed_goals_random",        "False",       "fixed-goal order: False = round-robin through the set (default); True = random pick each episode"),
+        ("--max_angular_vel",           "1.0",         "⚠ turn-rate cap (rad/s). min turn radius = max_linear_vel/this = 0.1/1.0 = 0.1 m (NEW default, robot can near-pivot → tight paths). OLD setup = 0.2 (radius 0.5 m) = the CCW-looping / low-efficiency cause. Pass 0.2 to reproduce the legacy MDP (new runs ≠ old 0.2 runs)"),
+        ("--max_linear_vel",            "0.1",         "forward-speed cap (m/s) on |action[0]|; unchanged"),
+        ("--actor_entropy",             "-1.0",        "exploration: overrides actor.entropy (default 3e-4) when ≥0; higher = sustained exploration (delays policy collapse). -1.0 = untouched. Searched by the BO"),
         ("--prefill",                   "500",         "random steps before training (once)"),
         ("--time_limit",                "250",         "max steps per episode before timeout"),
         ("--resource_logging",          "true",        "CPU/RAM/GPU logging (False to disable)"),
@@ -2294,6 +2486,10 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
     st.dataframe(bo_params, width="stretch", hide_index=True, key="cmd_params_bo")
 
     st.caption(
+        "BO search space now co-tunes **actor_entropy** (log 1e-4–1e-2, exploration) with the "
+        "reward weights (step/turn widened to 0–0.1); it **scores on the Hybrid-A\\* efficiency** "
+        "(`planner_path_efficiency_hybrid` — the fair nonholonomic + obstacle-aware metric, never "
+        "blank). Trials run on the new 1.0-rad/s kinematics default. "
         "Full reference: see `CLAUDE.md` (Reward-Weight Tuning, Example Commands) "
         "and `docs/evaluation_loop.md` for the eval cadence."
     )
@@ -2323,7 +2519,13 @@ def main():
         )
         if folder != prev:
             st.session_state["_csv_folder"] = folder
-            st.cache_data.clear()  # different folder → drop caches keyed only by run_name
+            # Only clear the loaders that read the global CSV_DIR (their cache key
+            # is run_name alone, so it can't tell folders apart). Folder-independent
+            # caches (list_csv_folders, scan_all_runs, load_*_in) keep their TTL —
+            # no need to discard them on every folder click.
+            for _fn in (scan_runs, load_bb, load_wb, load_pl,
+                       load_resource, load_resource_eval, load_tune_trials):
+                _fn.clear()
         CSV_DIR   = CSV_BASE   if folder == "." else CSV_BASE   / folder
         PLOTS_DIR = PLOTS_BASE if folder == "." else PLOTS_BASE / folder
 
@@ -2383,24 +2585,32 @@ def main():
         st.divider()
         st.caption(f"CSVs: `{CSV_DIR}`\nPlots: `{PLOTS_DIR}`")
 
-    # ── Load data ────────────────────────────────────────────────────────────
-    # No global st.stop() when nothing is selected — the 📖 Commands tab must stay
-    # reachable. Data-dependent tabs below show a "select a run" hint instead.
-    bb_data = {r: load_bb(r) for r in selected}
-    wb_data = {r: load_wb(r) for r in selected}
-    _NO_RUN_MSG = "← Select one or more runs from the sidebar to see this tab."
-
-    # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab_ov, tab_bb, tab_wb, tab_pl, tab_res, tab_bo, tab_cmp, tab_conv, tab_run = st.tabs([
+    # ── Page selector ────────────────────────────────────────────────────────
+    # A radio (not st.tabs) is what makes this genuinely lazy: Streamlit reruns
+    # the whole script every interaction and st.tabs() executes EVERY tab body
+    # regardless of which one is visually open — with 9 sections (one, BO
+    # Trials, independently touching 100+ trial CSVs) that meant every click
+    # anywhere in the app re-ran every section. A radio's un-selected branches
+    # are plain Python `elif`s that never execute at all.
+    PAGES = [
         "📊 Overview", "📈 Blackbox Charts", "⚙️ Whitebox Charts",
         "📍 Path Efficiency", "⚡ Resource Cost", "🏁 BO Trials", "🔀 Compare",
         "🎯 Convergence", "📖 Commands",
-    ])
+    ]
+    view = st.radio("View", PAGES, horizontal=True, key="main_view",
+                    label_visibility="collapsed")
+    st.divider()
 
-    with tab_ov:
+    # No global st.stop() when nothing is selected — 📖 Commands must stay
+    # reachable. Data-dependent pages below show a "select a run" hint instead.
+    _NO_RUN_MSG = "← Select one or more runs from the sidebar to see this page."
+
+    if view == "📊 Overview":
         if not selected:
             st.info(_NO_RUN_MSG)
         else:
+            bb_data = {r: load_bb(r) for r in selected}
+            wb_data = {r: load_wb(r) for r in selected}
             _section_summary(selected, bb_data, wb_data)
             st.divider()
             _section_comparison(selected, bb_data, wb_data)
@@ -2414,19 +2624,21 @@ def main():
             )
             _section_eval_checkpoints(selected, int(n_per_ckpt))
 
-    with tab_bb:
+    elif view == "📈 Blackbox Charts":
         if not selected:
             st.info(_NO_RUN_MSG)
         else:
+            bb_data = {r: load_bb(r) for r in selected}
             _section_bb(selected, bb_data, show_cumulative, show_r100, show_r500)
 
-    with tab_wb:
+    elif view == "⚙️ Whitebox Charts":
         if not selected:
             st.info(_NO_RUN_MSG)
         else:
+            wb_data = {r: load_wb(r) for r in selected}
             _section_wb(selected, wb_data)
 
-    with tab_pl:
+    elif view == "📍 Path Efficiency":
         if len(selected) == 0:
             st.info(_NO_RUN_MSG)
         elif len(selected) == 1:
@@ -2438,7 +2650,7 @@ def main():
                 _section_planner(rn, load_pl(rn), load_bb(rn))
                 st.divider()
 
-    with tab_res:
+    elif view == "⚡ Resource Cost":
         if not selected:
             st.info(_NO_RUN_MSG)
         elif len(selected) == 1:
@@ -2450,22 +2662,26 @@ def main():
                 _section_resource(rn, load_resource(rn), load_resource_eval(rn))
                 st.divider()
 
-    with tab_bo:
+    elif view == "🏁 BO Trials":
         _section_bo_trials(load_tune_trials())
 
-    with tab_cmp:
+    elif view == "🔀 Compare":
         _section_compare()
 
-    with tab_conv:
+    elif view == "🎯 Convergence":
         _section_convergence()
 
-    with tab_run:
+    elif view == "📖 Commands":
         _section_commands()
 
     # ── Auto-refresh ─────────────────────────────────────────────────────────
     if auto_refresh:
         time.sleep(refresh_secs)
-        st.cache_data.clear()
+        # No cache_data.clear() here — CACHE_TTL (20s) already re-fetches stale
+        # entries on next access; forcing a full clear every cycle re-triggers
+        # every cached loader (including the BO-trial loop) from a cold cache
+        # even when nothing changed. The manual "Refresh now" button below is
+        # the explicit one-shot "I want it now" action and keeps its full clear.
         st.rerun()
 
 

@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from envs.path_viz import _draw_stage, _draw_robot, REACH_THRESHOLD
-from envs.stage_map import (STAGE_ARENAS, get_grid, astar_plan, dubins_plan,
+from envs.stage_map import (STAGE_ARENAS, get_grid, astar_plan, hybrid_astar_plan,
                             RESOLUTION)
 
 
@@ -54,8 +54,9 @@ def main() -> int:
     ap.add_argument('--out', type=str, default='',
                     help='Output PNG path (default path_plots/fixed_goals_preview_stage{N}.png).')
     ap.add_argument('--radius', type=float, default=0.5,
-                    help='Min turning radius (m) for the Dubins reference = '
-                         'max_linear_vel/max_angular_vel (default 0.5 = 0.1/0.2).')
+                    help='Min turning radius (m) for the Hybrid-A* reference = '
+                         'max_linear_vel/max_angular_vel (default 0.5 = 0.1/0.2; the new '
+                         'training default 1.0 rad/s gives 0.1 m).')
     ap.add_argument('--start_heading', type=float, default=0.0,
                     help='Robot start heading in radians (default 0 = facing +x).')
     args = ap.parse_args()
@@ -81,14 +82,14 @@ def main() -> int:
     _draw_stage(ax, args.stage)
 
     # Robot start marker at origin (same green Burger as the training plots),
-    # nose drawn at the true start heading the Dubins arc departs from.
+    # nose drawn at the true start heading the Hybrid-A* path departs from.
     _draw_robot(ax, 0.0, 0.0, heading=args.start_heading,
                 body_color='#2ca02c', label='Start (0, 0)')
     start_xyt = (0.0, 0.0, args.start_heading)
 
-    # Colours: Dubins (blue solid) is the primary nonholonomic reference; the old
+    # Colours: Hybrid-A* (blue solid) is the primary nonholonomic reference; the old
     # holonomic A* drops to teal dash-dot for contrast (matches the per-episode PNG).
-    DUBINS_C, ASTAR_C = '#1f77b4', '#17becf'
+    HYBRID_C, ASTAR_C = '#1f77b4', '#17becf'
 
     n_ok = 0
     summary: list[str] = []
@@ -96,12 +97,12 @@ def main() -> int:
         # A* region path (holonomic, stops at the 0.4 m acceptance radius)
         a_len, a_wp = astar_plan(grid, arena, start, goal, REACH_THRESHOLD)
         a_ok = a_len is not None and a_wp
-        # Dubins-to-point reference (nonholonomic, respects --radius)
-        d_len, d_wp, d_status = dubins_plan(grid, arena, start_xyt, goal,
-                                            args.radius, REACH_THRESHOLD)
-        d_ok = d_status == 'ok' and d_wp
+        # Hybrid-A* reference (nonholonomic + obstacle-aware, respects --radius)
+        h_len, h_wp, h_status = hybrid_astar_plan(grid, arena, start_xyt, goal,
+                                                  args.radius, REACH_THRESHOLD)
+        h_ok = h_status == 'ok' and h_wp
 
-        ec = '#2ca02c' if (a_ok or d_ok) else '#d62728'  # circle: green ok / red none
+        ec = '#2ca02c' if (a_ok or h_ok) else '#d62728'  # circle: green ok / red none
 
         # Acceptance circle (dashed) + faint fill
         ax.add_patch(mpatches.Circle(goal, REACH_THRESHOLD, fill=False,
@@ -115,17 +116,17 @@ def main() -> int:
             ax.plot([p[0] for p in a_wp], [p[1] for p in a_wp], '-.',
                     color=ASTAR_C, linewidth=1.4, alpha=0.9, zorder=4,
                     label='A* (holonomic)' if i == 0 else '_nolegend_')
-        # Dubins overlay (blue solid, primary)
-        if d_ok:
-            ax.plot([p[0] for p in d_wp], [p[1] for p in d_wp], '-',
-                    color=DUBINS_C, linewidth=2.0, alpha=0.95, zorder=5,
-                    label=f'Dubins (r={args.radius:.2f} m)' if i == 0 else '_nolegend_')
+        # Hybrid-A* overlay (blue solid, primary)
+        if h_ok:
+            ax.plot([p[0] for p in h_wp], [p[1] for p in h_wp], '-',
+                    color=HYBRID_C, linewidth=2.0, alpha=0.95, zorder=5,
+                    label=f'Hybrid-A* (r={args.radius:.2f} m)' if i == 0 else '_nolegend_')
             n_ok += 1
 
         a_txt = f"A*={a_len:.2f}" if a_ok else "A*=blocked"
-        d_txt = f"Dub={d_len:.2f}" if d_ok else f"Dub={d_status}"
-        tag = f"#{i} ({goal[0]:+.2f},{goal[1]:+.2f})\n{d_txt} | {a_txt}"
-        summary.append(f"  goal #{i} ({goal[0]:+.2f}, {goal[1]:+.2f}): {d_txt} m | {a_txt} m")
+        h_txt = f"Hyb={h_len:.2f}" if h_ok else f"Hyb={h_status}"
+        tag = f"#{i} ({goal[0]:+.2f},{goal[1]:+.2f})\n{h_txt} | {a_txt}"
+        summary.append(f"  goal #{i} ({goal[0]:+.2f}, {goal[1]:+.2f}): {h_txt} m | {a_txt} m")
 
         # Goal star + index/coord label
         ax.plot(goal[0], goal[1], '*', color=ec, markersize=15, zorder=6)
@@ -136,8 +137,8 @@ def main() -> int:
 
     ax.set_title(
         f'Fixed-goal preview — Stage {args.stage}  '
-        f'(Dubins r={args.radius:.2f} m, start heading {args.start_heading:.2f} rad)\n'
-        f'{len(goals)} goal(s), {n_ok} Dubins-reachable  (round-robin order: #0, #1, …)',
+        f'(Hybrid-A* r={args.radius:.2f} m, start heading {args.start_heading:.2f} rad)\n'
+        f'{len(goals)} goal(s), {n_ok} Hybrid-A*-reachable  (round-robin order: #0, #1, …)',
         fontsize=10,
     )
     ax.set_xlabel('x (m)')
@@ -155,14 +156,14 @@ def main() -> int:
     fig.savefig(out, dpi=120, bbox_inches='tight')
     plt.close(fig)
 
-    print(f"Stage {args.stage} — {len(goals)} goal(s), {n_ok} Dubins-reachable "
+    print(f"Stage {args.stage} — {len(goals)} goal(s), {n_ok} Hybrid-A*-reachable "
           f"(radius {args.radius:.2f} m):")
     print('\n'.join(summary))
     print(f"\nSaved: {out}")
     if n_ok < len(goals):
-        print("NOTE: some goals are Dubins-blocked (the curvature-bounded curve would "
-              "hit an obstacle) — efficiency_dubins is honestly blank there; A* may "
-              "still route around. Pick other coords if you want a clean Dubins preview.")
+        print("NOTE: some goals are Hybrid-A*-unreachable (no curvature-bounded, "
+              "collision-free path) — efficiency_hybrid is blank there. Pick other "
+              "coords if you want a clean preview.")
         return 1
     return 0
 

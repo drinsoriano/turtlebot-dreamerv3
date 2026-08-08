@@ -80,6 +80,7 @@ class Env(Node):
                  pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                  pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                  fixed_goals='', fixed_goals_random=False,
+                 max_linear_vel=0.1, max_angular_vel=1.0,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super().__init__("trainer_node")
 
@@ -107,6 +108,7 @@ class Env(Node):
                              pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
                              pbrs_distance_scale, pbrs_gamma,
                              fixed_goals, fixed_goals_random,
+                             max_linear_vel, max_angular_vel,
                              csv_dir, plots_dir)
 
     def pause_simulation(self):
@@ -138,6 +140,7 @@ class Env(Node):
                         pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                         pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                         fixed_goals='', fixed_goals_random=False,
+                        max_linear_vel=0.1, max_angular_vel=1.0,
                         csv_dir='./csv_logs', plots_dir='./path_plots'):
         self.num_states = 14
         self.num_actions = 2
@@ -152,6 +155,11 @@ class Env(Node):
         self.max_steps = max_steps
         self.lidar = lidar
         self.odometry_mode = odometry_mode
+
+        # Action -> velocity caps (min turn radius = max_linear_vel / max_angular_vel).
+        # New default 1.0 rad/s -> radius 0.1 m; legacy 0.5 m via --max_angular_vel 0.2.
+        self.max_linear_vel = float(max_linear_vel)
+        self.max_angular_vel = float(max_angular_vel)
 
         # Fixed-goal mode (diagnostic): '' = normal random sampling. Else parse the
         # ';'-separated 'x,y' list once into self.fixed_goal_list; round-robin (or random
@@ -249,6 +257,7 @@ class Env(Node):
                 'rolling_success_rate_100', 'rolling_collision_rate_100',
                 'rolling_success_rate_500', 'rolling_collision_rate_500',
                 'episode_steps',
+                'local_efficiency',
                 'goal_id',
             ])
         self._bb_file.flush()
@@ -295,6 +304,7 @@ class Env(Node):
         self.pbrs_distance_scale = pbrs_distance_scale
         self.pbrs_gamma = pbrs_gamma
         self.prev_distance_to_target = 0.0
+        self.last_distance_to_target = 0.0  # terminal-state goal distance (local_efficiency)
         self.prev_angle_to_target = 0.0   # PBRS: previous-step (s_t) angle-to-goal
         self.angle_to_target = 0.0        # set every step in get_state() (s_{t+1})
         self._rc_terminal = self._rc_progress = self._rc_step = 0.0
@@ -447,6 +457,11 @@ class Env(Node):
         # Thesis metrics reset
         self.start_x = self.odom_data.pose.pose.position.x
         self.start_y = self.odom_data.pose.pose.position.y
+        # Start heading (radians) for the Hybrid-A* reference — computed unconditionally
+        # (the prev_odom_yaw above is only set for non-'none' odometry modes).
+        _qs = self.odom_data.pose.pose.orientation
+        self.start_yaw = math.atan2(2 * (_qs.w * _qs.z + _qs.x * _qs.y),
+                                    1 - 2 * (_qs.y * _qs.y + _qs.z * _qs.z))
         self.prev_x = self.start_x
         self.prev_y = self.start_y
         self.path_length = 0.0
@@ -459,6 +474,7 @@ class Env(Node):
 
         # Reward-shaping per-episode reset
         self.prev_distance_to_target = self.initial_distance
+        self.last_distance_to_target = self.initial_distance
         # PBRS: seed Φ(s_0) angle from the reset state (get_state(0,0) above set it)
         self.prev_angle_to_target = self.angle_to_target
         self._rc_terminal = self._rc_progress = self._rc_step = 0.0
@@ -509,6 +525,11 @@ class Env(Node):
             rs100, rc100,
             rs500, rc500,
             self.step_counter,   # episode_steps: total steps this episode (all outcomes)
+            # local_efficiency: mapless per-episode motion efficiency —
+            # goal-distance reduction per metre travelled, clamped to [-1, 1].
+            round(max(-1.0, min(
+                (self.initial_distance - self.last_distance_to_target) / self.path_length,
+                1.0)), 4) if self.path_length > 0 else 0.0,
             self._goal_id(),
         ])
         self._bb_file.flush()
@@ -531,22 +552,28 @@ class Env(Node):
                 'planned_path_length_center',
                 'planner_path_efficiency_center', 'planner_path_efficiency_center_raw',
                 'planner_status_center',
+                'planned_path_length_hybrid',
+                'planner_path_efficiency_hybrid', 'planner_path_efficiency_hybrid_raw',
+                'planner_status_hybrid',
                 'goal_id',
             ])
         self._pl_file.flush()
 
     def _compute_planned_path(self) -> tuple:
-        """Run A* from episode start to both goal region and goal centre.
+        """Run the reference planners from episode start to the goal.
 
-        Returns (reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status).
-        Status values: ok / no_path / planner_error / unsupported_stage.
-        Grid is loaded once; two A* calls share it.
+        Returns (reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status,
+                 hyb_len, hyb_wp, hyb_status). reg/cen are the holonomic grid-A*
+        region/centre metrics; hyb is the nonholonomic Hybrid-A* metric (respects the
+        run's min turn radius AND avoids obstacles — fair on every stage). Statuses:
+        ok / no_path / planner_error / unsupported_stage. Grid is loaded once.
         """
         try:
-            from envs.stage_map import get_grid, astar_plan, STAGE_ARENAS, RESOLUTION
+            from envs.stage_map import (get_grid, astar_plan, hybrid_astar_plan,
+                                        STAGE_ARENAS, RESOLUTION)
             if self.stage not in STAGE_ARENAS:
                 s = 'unsupported_stage'
-                return None, [], s, None, [], s
+                return None, [], s, None, [], s, None, [], s
             grid, arena = get_grid(self.stage)
             start = (self.start_x, self.start_y)
             goal  = (self.target_x, self.target_y)
@@ -560,18 +587,27 @@ class Env(Node):
             cen_len, cen_wp = astar_plan(grid, arena, start, goal, RESOLUTION)
             cen_status = 'ok' if cen_len is not None else 'no_path'
 
-            return reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status
+            # Hybrid-A* metric — nonholonomic, radius = max_linear_vel/max_angular_vel
+            # (self-tracks the run's kinematics). Forward-only arcs + obstacle avoidance.
+            radius = self.max_linear_vel / max(self.max_angular_vel, 1e-6)
+            hyb_len, hyb_wp, hyb_status = hybrid_astar_plan(
+                grid, arena, (self.start_x, self.start_y, self.start_yaw), goal,
+                radius, REACH_TRESHOLD)
+
+            return (reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status,
+                    hyb_len, hyb_wp, hyb_status)
         except Exception:
             s = 'planner_error'
-            return None, [], s, None, [], s
+            return None, [], s, None, [], s, None, [], s
 
     def _write_planning_csv(self, outcome: str) -> None:
         if self.path_length <= 0:
             reg_len, reg_wp, reg_status = None, [], 'zero_actual_path'
             cen_len, cen_wp, cen_status = None, [], 'zero_actual_path'
+            hyb_len, hyb_wp, hyb_status = None, [], 'zero_actual_path'
         else:
-            reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status = \
-                self._compute_planned_path()
+            (reg_len, reg_wp, reg_status, cen_len, cen_wp, cen_status,
+             hyb_len, hyb_wp, hyb_status) = self._compute_planned_path()
 
         actual = self.path_length
 
@@ -591,6 +627,14 @@ class Env(Node):
         else:
             cen_raw = cen_capped = cen_out = ''
 
+        # Hybrid-A* metric (nonholonomic, obstacle-aware — fair on every stage)
+        if hyb_status == 'ok':
+            hyb_raw    = round(hyb_len / actual, 4)
+            hyb_capped = round(min(hyb_raw, 1.0), 4)
+            hyb_out    = round(hyb_len, 4)
+        else:
+            hyb_raw = hyb_capped = hyb_out = ''
+
         dt_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self._pl_writer.writerow([
             dt_str,
@@ -605,14 +649,16 @@ class Env(Node):
             round(actual, 4),
             reg_out, reg_capped, reg_raw, reg_status,
             cen_out, cen_capped, cen_raw, cen_status,
+            hyb_out, hyb_capped, hyb_raw, hyb_status,
             self._goal_id(),
         ])
         self._pl_file.flush()
 
         # Save path visualization plot (non-critical; never crashes training)
-        if reg_wp or cen_wp:
+        if reg_wp or cen_wp or hyb_wp:
             try:
                 from envs.path_viz import save_episode_plot
+                radius = self.max_linear_vel / max(self.max_angular_vel, 1e-6)
                 save_episode_plot(
                     stage=self.stage,
                     start=(self.start_x, self.start_y),
@@ -627,6 +673,9 @@ class Env(Node):
                     efficiency_center=cen_capped if cen_status == 'ok' else '',
                     plots_dir=self._plots_dir,
                     timestamp=dt_str,
+                    hybrid_waypoints=hyb_wp,
+                    start_heading=self.start_yaw,
+                    hybrid_radius=radius,
                 )
             except Exception:
                 pass
@@ -636,6 +685,9 @@ class Env(Node):
         done = False
 
         distance = np.sqrt((turtle_x - target_x)**2 + (turtle_y - target_y)**2)
+        # Exact terminal-state goal distance for the local_efficiency blackbox metric —
+        # the terminal CSV writes below run before prev_distance_to_target is refreshed.
+        self.last_distance_to_target = distance
 
         if distance < REACH_TRESHOLD:
             self.reached = True
@@ -1000,8 +1052,10 @@ class Env(Node):
             self.get_logger().info("No mark to delete or deletion failed.")
 
     def publish_action(self, action):
-        linear_vel = np.abs(float(action[0])) * 0.1
-        angular_vel = float(action[1]) * 2 * 0.1
+        # min turn radius = max_linear_vel / max_angular_vel. Defaults 0.1 / 1.0 = 0.1 m.
+        # Legacy 0.5 m-radius behaviour (old action[1]*2*0.1): --max_angular_vel 0.2.
+        linear_vel = np.abs(float(action[0])) * self.max_linear_vel
+        angular_vel = float(action[1]) * self.max_angular_vel
         self.publish_vel(linear_vel, angular_vel)
 
 
@@ -1014,6 +1068,7 @@ class Turtle(gym.Env):
                  pbrs_scale=1.0, pbrs_distance_weight=1.0, pbrs_angle_weight=0.2,
                  pbrs_distance_scale=5.0, pbrs_gamma=0.997,
                  fixed_goals='', fixed_goals_random=False,
+                 max_linear_vel=0.1, max_angular_vel=1.0,
                  csv_dir='./csv_logs', plots_dir='./path_plots'):
         super(Turtle, self).__init__()
         self._env = Env(stage, max_steps, lidar, run_name, mode, odometry_mode,
@@ -1024,6 +1079,7 @@ class Turtle(gym.Env):
                         pbrs_scale, pbrs_distance_weight, pbrs_angle_weight,
                         pbrs_distance_scale, pbrs_gamma,
                         fixed_goals, fixed_goals_random,
+                        max_linear_vel, max_angular_vel,
                         csv_dir, plots_dir)
 
         self.observation_space = spaces.Dict({

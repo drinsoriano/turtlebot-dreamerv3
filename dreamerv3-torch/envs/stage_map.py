@@ -385,11 +385,13 @@ def get_grid(stage: int) -> tuple[np.ndarray, dict]:
     return _GRID_CACHE[stage]
 
 
-# ── Nonholonomic (Dubins-to-point) reference ───────────────────────────────────
-# A curvature-bounded reference path that respects the robot's minimum turning
-# radius, unlike the holonomic grid A* above. Used as a *fair* denominator for the
-# path-efficiency metric. This is an independent closed-form curve — it does NOT
-# use A*; the only shared input is get_grid(), and only for the collision check.
+# ── Nonholonomic reference: Hybrid-A* (curvature-bounded, obstacle-aware) ──────
+# A reference path that respects the robot's minimum turning radius AND routes
+# around obstacles — a *fair* efficiency denominator on every stage, unlike the
+# holonomic grid A* above. Forward-only (curvature-bounded) arc motion primitives +
+# an analytic arc shot to the goal + a holonomic-with-obstacles heuristic, memoised
+# over the start/goal pairs that repeat across episodes (fixed goals, discrete spawn
+# points). Post-hoc metric only — never fed into training.
 
 
 def is_occupied(grid: np.ndarray, arena: dict, x: float, y: float,
@@ -415,17 +417,17 @@ def _poly_len(pts: list[tuple[float, float]]) -> float:
                for i in range(len(pts) - 1))
 
 
-def _dubins_cs_path(start_xyt: tuple[float, float, float],
-                    goal_xy: tuple[float, float],
-                    radius: float,
-                    resolution: float = RESOLUTION) -> tuple:
-    """Shortest **curve-then-straight (C·S)** bounded-curvature path from a directed
-    start pose to a goal *point* with **free final heading**.
+def _arc_shot(start_xyt: tuple[float, float, float],
+              goal_xy: tuple[float, float],
+              radius: float,
+              resolution: float = RESOLUTION) -> tuple:
+    """Forward-only **curve-then-straight (C·S)** arc from a directed start pose to a
+    goal *point* with **free final heading** — the Hybrid-A* analytic expansion.
 
-    Optimal Dubins solution to a point (free orientation) when the goal lies outside
-    both radius-`r` turning circles tangent to the start pose. Returns
-    (length_metres, waypoints) sampled at ~`resolution`, or (None, []) if the goal is
-    inside both circles (degenerate — only at sub-radius range).
+    Optimal bounded-curvature path to a point when the goal lies outside both
+    radius-`r` turning circles tangent to the start pose. Returns (length_metres,
+    waypoints) sampled at ~`resolution` (waypoints[0] == start), or (None, []) if the
+    goal is inside both circles (degenerate — sub-radius range only).
     """
     x0, y0, th0 = start_xyt
     gx, gy = goal_xy
@@ -473,43 +475,218 @@ def _dubins_cs_path(start_xyt: tuple[float, float, float],
     return total, wp
 
 
-def dubins_point_length(start_xyt: tuple[float, float, float],
-                        goal_xy: tuple[float, float],
-                        radius: float) -> float | None:
-    """Length (metres) of the C·S Dubins-to-point path; None if degenerate. See
-    _dubins_cs_path()."""
-    length, _ = _dubins_cs_path(start_xyt, goal_xy, radius)
-    return length
+# ── Hybrid-A* search ───────────────────────────────────────────────────────────
+
+_HEUR_CACHE: dict = {}     # (id(grid), goal, reach) -> 2-D cost-to-goal field (m)
+_HYBRID_CACHE: dict = {}   # discretised (start, goal, radius, …) -> (len, wp, status)
 
 
-def dubins_plan(grid: np.ndarray, arena: dict,
-                start_xyt: tuple[float, float, float],
-                goal_xy: tuple[float, float],
-                radius: float,
-                reach_threshold: float = 0.4,
-                resolution: float = RESOLUTION) -> tuple:
-    """Curvature-bounded reference to the goal *region* (stops at `reach_threshold`,
-    matching the success condition), collision-checked against the inflated grid.
+def _holonomic_cost_field(grid, arena, goal_xy, reach_threshold, resolution):
+    """Backward Dijkstra over free cells from the goal region → metres-to-goal per
+    cell (np.inf if unreachable). Admissible, obstacle-aware Hybrid-A* heuristic
+    (holonomic distance ≤ nonholonomic), cached per (grid, goal, reach)."""
+    key = (id(grid), round(goal_xy[0], 3), round(goal_xy[1], 3),
+           round(reach_threshold, 3), round(resolution, 4))
+    cached = _HEUR_CACHE.get(key)
+    if cached is not None:
+        return cached
 
-    Returns (length_metres, waypoints, status). status:
-      'ok'            — valid, collision-free curve to the region boundary
-      'dubins_blocked'— the curve crosses an inflated obstacle (honest blank)
-      'no_path'       — degenerate (goal within radius of the start circles)
-      'planner_error' — unexpected exception
-    Numeric length is meaningful only for status == 'ok'.
+    h_cells, w_cells = grid.shape
+
+    def to_cell(x, y):
+        return (int(round((y - arena['y_min']) / resolution)),
+                int(round((x - arena['x_min']) / resolution)))
+
+    def to_xy(iy, ix):
+        return arena['x_min'] + ix * resolution, arena['y_min'] + iy * resolution
+
+    def free(iy, ix):
+        return 0 <= iy < h_cells and 0 <= ix < w_cells and not grid[iy, ix]
+
+    gx, gy = goal_xy
+    gc = to_cell(gx, gy)
+    r_cells = int(math.ceil(reach_threshold / resolution))
+    cost = np.full((h_cells, w_cells), np.inf, dtype=np.float64)
+    heap = []
+    for diy in range(-r_cells, r_cells + 1):
+        for dix in range(-r_cells, r_cells + 1):
+            iy, ix = gc[0] + diy, gc[1] + dix
+            if free(iy, ix):
+                cx, cy = to_xy(iy, ix)
+                if (cx - gx) ** 2 + (cy - gy) ** 2 <= reach_threshold ** 2:
+                    cost[iy, ix] = 0.0
+                    heapq.heappush(heap, (0.0, iy, ix))
+
+    SQRT2 = resolution * math.sqrt(2)
+    MOVES = ((-1, 0, resolution), (1, 0, resolution), (0, -1, resolution),
+             (0, 1, resolution), (-1, -1, SQRT2), (-1, 1, SQRT2),
+             (1, -1, SQRT2), (1, 1, SQRT2))
+    while heap:
+        c, iy, ix = heapq.heappop(heap)
+        if c > cost[iy, ix]:
+            continue
+        for diy, dix, w in MOVES:
+            niy, nix = iy + diy, ix + dix
+            if not free(niy, nix):
+                continue
+            if diy != 0 and dix != 0 and (not free(iy + diy, ix) or not free(iy, ix + dix)):
+                continue
+            nc = c + w
+            if nc < cost[niy, nix]:
+                cost[niy, nix] = nc
+                heapq.heappush(heap, (nc, niy, nix))
+
+    _HEUR_CACHE[key] = cost
+    return cost
+
+
+def _arc_points(x, y, th, s, length, radius, resolution):
+    """Sample a forward arc of `length` from pose (x, y, th). s=0 straight, ±1
+    left/right (curvature ±1/radius). Returns (end_x, end_y, end_th, sample_pts)
+    where sample_pts excludes the start point and includes the end."""
+    n = max(1, int(math.ceil(length / resolution)))
+    pts = []
+    if s == 0:
+        for i in range(1, n + 1):
+            t = length * i / n
+            pts.append((x + t * math.cos(th), y + t * math.sin(th)))
+        return x + length * math.cos(th), y + length * math.sin(th), th, pts
+    for i in range(1, n + 1):
+        t = length * i / n
+        tht = th + s * t / radius
+        pts.append((x + s * radius * (math.sin(tht) - math.sin(th)),
+                    y - s * radius * (math.cos(tht) - math.cos(th))))
+    th_end = th + s * length / radius
+    return (x + s * radius * (math.sin(th_end) - math.sin(th)),
+            y - s * radius * (math.cos(th_end) - math.cos(th)),
+            th_end, pts)
+
+
+def _reconstruct(came, key):
+    """Rebuild the (x, y) waypoint polyline from start to `key` via stored arc segs."""
+    segs = []
+    k = key
+    while k is not None:
+        parent, pts = came[k]
+        segs.append(pts)
+        k = parent
+    segs.reverse()
+    out: list[tuple[float, float]] = []
+    for seg in segs:
+        out.extend(seg)
+    return out
+
+
+def hybrid_astar_plan(grid: np.ndarray, arena: dict,
+                      start_xyt: tuple[float, float, float],
+                      goal_xy: tuple[float, float],
+                      radius: float,
+                      reach_threshold: float = 0.4,
+                      resolution: float = RESOLUTION,
+                      n_headings: int = 24,
+                      prim_len: float = 0.25,
+                      max_pops: int = 40000) -> tuple:
+    """Curvature-bounded, obstacle-avoiding reference path to the goal *region*.
+
+    Returns (length_metres, waypoints, status), status ∈ {'ok','no_path',
+    'planner_error'}. The path respects the minimum turning `radius` (forward-only
+    arcs) and avoids inflated obstacles, so it is a fair nonholonomic efficiency
+    denominator on every stage. Memoised by the discretised (start, goal, radius)
+    tuple, which repeats constantly under fixed/discrete goals → amortised O(1).
     """
     try:
-        total, wp = _dubins_cs_path(start_xyt, goal_xy, radius, resolution)
-        if total is None or not wp:
-            return None, [], 'no_path'
+        h_cells, w_cells = grid.shape
+        x0, y0, th0 = start_xyt
         gx, gy = goal_xy
-        # Region semantics: drop the trailing samples inside the acceptance circle.
-        trimmed = [p for p in wp if math.hypot(p[0] - gx, p[1] - gy) > reach_threshold]
-        if not trimmed:
-            trimmed = wp[:1]
-        for (px, py) in trimmed:
-            if is_occupied(grid, arena, px, py, resolution):
-                return None, trimmed, 'dubins_blocked'
-        return _poly_len(trimmed), trimmed, 'ok'
+        dth = 2 * math.pi / n_headings
+
+        def to_cell(x, y):
+            return (int(round((y - arena['y_min']) / resolution)),
+                    int(round((x - arena['x_min']) / resolution)))
+
+        def thbin(t):
+            return int(round(t / dth)) % n_headings
+
+        def skey(x, y, th):
+            iy, ix = to_cell(x, y)
+            return (iy, ix, thbin(th))
+
+        ckey = (id(grid), to_cell(x0, y0), thbin(th0), to_cell(gx, gy),
+                round(radius, 3), round(reach_threshold, 3),
+                round(resolution, 4), n_headings, round(prim_len, 3))
+        memo = _HYBRID_CACHE.get(ckey)
+        if memo is not None:
+            return memo
+
+        if math.hypot(x0 - gx, y0 - gy) <= reach_threshold:
+            res = (0.0, [(x0, y0)], 'ok')
+            _HYBRID_CACHE[ckey] = res
+            return res
+
+        cost_field = _holonomic_cost_field(grid, arena, goal_xy, reach_threshold, resolution)
+
+        def heur(x, y):
+            iy, ix = to_cell(x, y)
+            if 0 <= iy < h_cells and 0 <= ix < w_cells:
+                h = cost_field[iy, ix]
+                return float(h) if math.isfinite(h) else None
+            return None
+
+        h0 = heur(x0, y0)
+        if h0 is None:                       # start not holonomically connected
+            res = (None, [], 'no_path')
+            _HYBRID_CACHE[ckey] = res
+            return res
+
+        sk0 = skey(x0, y0, th0)
+        open_heap = [(h0, 0.0, x0, y0, th0)]
+        gbest = {sk0: 0.0}
+        came = {sk0: (None, [(x0, y0)])}
+
+        pops = 0
+        while open_heap and pops < max_pops:
+            f, g, x, y, th = heapq.heappop(open_heap)
+            pops += 1
+            cur = skey(x, y, th)
+            if g > gbest.get(cur, float('inf')) + 1e-9:
+                continue
+
+            # Node already in the goal region → done.
+            if math.hypot(x - gx, y - gy) <= reach_threshold:
+                res = (g, _reconstruct(came, cur), 'ok')
+                _HYBRID_CACHE[ckey] = res
+                return res
+
+            # Analytic arc shot to the goal (free heading); finish if collision-free.
+            shot_len, shot_wp = _arc_shot((x, y, th), goal_xy, radius, resolution)
+            if shot_len is not None and shot_wp:
+                trimmed = [p for p in shot_wp
+                           if math.hypot(p[0] - gx, p[1] - gy) > reach_threshold]
+                if not any(is_occupied(grid, arena, px, py, resolution)
+                           for (px, py) in trimmed):
+                    path = _reconstruct(came, cur)
+                    if len(trimmed) >= 2:
+                        path = path + trimmed[1:]
+                    res = (g + _poly_len(trimmed), path, 'ok')
+                    _HYBRID_CACHE[ckey] = res
+                    return res
+
+            for s in (0, +1, -1):
+                nx, ny, nth, pts = _arc_points(x, y, th, s, prim_len, radius, resolution)
+                if any(is_occupied(grid, arena, px, py, resolution) for (px, py) in pts):
+                    continue
+                ng = g + prim_len
+                nk = skey(nx, ny, nth)
+                if ng < gbest.get(nk, float('inf')) - 1e-9:
+                    hh = heur(nx, ny)
+                    if hh is None:
+                        continue
+                    gbest[nk] = ng
+                    came[nk] = (cur, pts)
+                    heapq.heappush(open_heap, (ng + hh, ng, nx, ny, nth))
+
+        res = (None, [], 'no_path')
+        _HYBRID_CACHE[ckey] = res
+        return res
     except Exception:
         return None, [], 'planner_error'

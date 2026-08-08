@@ -22,12 +22,15 @@ import optuna
 THIS_DIR = pathlib.Path(__file__).resolve().parent
 
 # The five shaped-reward weights searched by tune_reward.py (see its SEARCH_SPACE).
+# All BO-searched flags (passed verbatim as --{key} to dreamer.py). actor_entropy is a
+# top-level flag (not --reward_*) but is exported and printed the same way.
 REWARD_KEYS = [
     "reward_progress_scale",
     "reward_step_penalty",
     "reward_turn_penalty",
     "reward_near_obstacle_scale",
     "reward_near_obstacle_sigma",
+    "actor_entropy",
 ]
 
 BASE_FIELDS = [
@@ -135,7 +138,8 @@ def main():
     print(f"trial {best['trial']}  run_name={best['run_name']}  "
           f"efficiency={best['efficiency']:.4f}  success={best['success']}")
     print("validation flags:")
-    print("  " + " ".join(f"--{k} {best[k]:.6g}" for k in REWARD_KEYS))
+    print("  " + " ".join(f"--{k} {best[k]:.6g}" for k in REWARD_KEYS
+                          if best.get(k) is not None))
 
 
 if __name__ == "__main__":

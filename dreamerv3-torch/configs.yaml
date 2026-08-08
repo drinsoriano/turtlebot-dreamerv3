@@ -52,6 +52,19 @@ defaults:
   fixed_goals: ''
   fixed_goals_random: False
 
+  # Action -> velocity caps. linear = |action[0]|*max_linear_vel,
+  # angular = action[1]*max_angular_vel. min turn radius = max_linear_vel/max_angular_vel.
+  # NEW default 1.0 rad/s => radius 0.1/1.0 = 0.1 m (robot can near-pivot, tight paths).
+  # Legacy 0.5 m-radius behaviour (the CCW-looping / low-efficiency setup): --max_angular_vel 0.2
+  max_linear_vel: 0.1
+  max_angular_vel: 1.0
+
+  # Exploration override: overrides the nested actor.entropy coefficient (default 3e-4)
+  # when >= 0, so it is CLI-settable as --actor_entropy. Sentinel -1.0 = leave untouched
+  # (byte-for-byte unchanged). Higher = sustained exploration (delays policy collapse).
+  # Searched by tune_reward.py BO. Applied in dreamer.py main() before the agent is built.
+  actor_entropy: -1.0
+
   # Environment
   task: 'turtle'
   time_limit: 250

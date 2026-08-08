@@ -152,6 +152,9 @@ def save_episode_plot(
     efficiency_center: float | str = '',
     plots_dir: str = './path_plots',
     timestamp: str = '',
+    hybrid_waypoints: list[tuple[float, float]] | None = None,
+    start_heading: float | None = None,
+    hybrid_radius: float | None = None,
 ) -> None:
     """Save top-down path comparison plot to {plots_dir}/{run_name}/."""
     out_dir = os.path.join(plots_dir, run_name)
@@ -178,17 +181,28 @@ def save_episode_plot(
     )
     ax.add_patch(goal_fill)
 
-    # A* reference path — region metric (blue)
+    # Hybrid-A* nonholonomic reference (prominent blue solid) — the fair denominator;
+    # respects the min turn radius and avoids obstacles. Drawn first (under A*).
+    if hybrid_waypoints and len(hybrid_waypoints) >= 2:
+        hyb_len = _path_len(hybrid_waypoints)
+        hxs, hys = zip(*hybrid_waypoints)
+        r_str = f' (r={hybrid_radius:.2f} m)' if hybrid_radius is not None else ''
+        ax.plot(hxs, hys, color='#1f77b4', linewidth=2.0, zorder=4,
+                label=f'Hybrid-A*{r_str} — {hyb_len:.2f} m')
+        ax.plot(hxs[-1], hys[-1], 'o', color='#1f77b4', markersize=6, zorder=7,
+                label='_nolegend_')
+
+    # A* reference path — region metric (teal dash-dot; secondary holonomic baseline)
     astar_endpoint: tuple[float, float] | None = None
     if len(astar_waypoints) >= 2:
         reg_len = _path_len(astar_waypoints)
         xs, ys = zip(*astar_waypoints)
-        ax.plot(xs, ys, color='#1f77b4', linewidth=2.0, zorder=3,
+        ax.plot(xs, ys, color='#17becf', linewidth=1.6, linestyle='-.', zorder=3,
                 label=f'A* region — {reg_len:.2f} m')
         astar_endpoint = astar_waypoints[-1]
     elif len(astar_waypoints) == 1:
         ax.plot(astar_waypoints[0][0], astar_waypoints[0][1],
-                'o', color='#1f77b4', markersize=6, zorder=3,
+                'o', color='#17becf', markersize=6, zorder=3,
                 label='A* region (start at goal)')
         astar_endpoint = astar_waypoints[0]
 
@@ -209,7 +223,7 @@ def save_episode_plot(
         ep_dist = math.hypot(ex - goal[0], ey - goal[1])
         valid = ep_dist <= REACH_THRESHOLD
         valid_tag = 'valid' if valid else 'OUTSIDE'
-        ep_color  = '#1f77b4' if valid else '#e31a1c'
+        ep_color  = '#17becf' if valid else '#e31a1c'
         ax.plot(ex, ey, 's', color=ep_color, markersize=8, zorder=7,
                 label='_nolegend_')
         ep_dist_str = f'  |  ep_d={ep_dist:.3f} m [{valid_tag}]'
@@ -225,9 +239,11 @@ def save_episode_plot(
     ax.plot(goal[0], goal[1], '*', color='#d62728', markersize=14,
             zorder=6, label='Goal center')
 
-    # TurtleBot3 Burger markers at the start and final poses (visualization only)
-    _draw_robot(ax, start[0], start[1],
-                _heading_at(list(robot_traj), end=False),
+    # TurtleBot3 Burger markers at the start and final poses (visualization only).
+    # Use the true reset heading when given (matches the Hybrid-A* start nose); else
+    # fall back to inferring it from the first trajectory segment.
+    start_h = start_heading if start_heading is not None else _heading_at(list(robot_traj), end=False)
+    _draw_robot(ax, start[0], start[1], start_h,
                 body_color='#2ca02c', label='Robot (start)')
     if robot_traj:
         rxe, rye = robot_traj[-1]

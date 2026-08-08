@@ -52,10 +52,13 @@ THIS_DIR = pathlib.Path(__file__).resolve().parent
 # fails to generalize to cluttered stages (see plan "Risks").
 SEARCH_SPACE = {
     "reward_progress_scale":      ("log",     0.1, 3.0),
-    "reward_step_penalty":        ("uniform", 0.0, 0.05),
-    "reward_turn_penalty":        ("uniform", 0.0, 0.05),
+    "reward_step_penalty":        ("uniform", 0.0, 0.1),    # widened (was 0.0-0.05) — stronger incentive headroom
+    "reward_turn_penalty":        ("uniform", 0.0, 0.1),    # widened (was 0.0-0.05)
     "reward_near_obstacle_scale": ("uniform", 0.0, 0.5),
     "reward_near_obstacle_sigma": ("uniform", 0.1, 0.5),
+    # Exploration coefficient (Lever C). The generic command builder emits this as
+    # --actor_entropy (not a --reward_* flag); dreamer.py injects it into actor.entropy.
+    "actor_entropy":              ("log",     1e-4, 1e-2),
 }
 
 # Number of trailing eval rows (episodes) used to score a run — end-of-training
@@ -99,18 +102,26 @@ def _tail(path, n=25):
 def score_run(run_name, csv_dir, window=SCORE_WINDOW):
     """Return (efficiency, success_fraction, n_eff_rows) from the eval CSVs.
 
-    efficiency      : mean planner_path_efficiency over the last `window` rows whose
-                      planner_status == 'ok'  (0.0 if none).
+    efficiency      : mean nonholonomic path efficiency over the last `window` rows
+                      whose hybrid status is 'ok' (the fair Hybrid-A* metric — never
+                      blank, so robust on every stage). Falls back to the holonomic
+                      planner_path_efficiency on pre-Hybrid CSVs. 0.0 if none.
     success_fraction: fraction of the last `window` eval episodes that succeeded
                       (None if the blackbox eval CSV is missing/empty).
     """
     pl_rows = _read_rows(os.path.join(csv_dir, f"planning_eval_{run_name}.csv"))
-    ok = [r for r in pl_rows if r.get("planner_status") == "ok"]
+    # Prefer the fair Hybrid-A* metric; fall back to holonomic A* on older CSVs.
+    use_hybrid = bool(pl_rows) and ("planner_status_hybrid" in pl_rows[0])
+    if use_hybrid:
+        status_col, eff_col = "planner_status_hybrid", "planner_path_efficiency_hybrid"
+    else:
+        status_col, eff_col = "planner_status", "planner_path_efficiency"
+    ok = [r for r in pl_rows if r.get(status_col) == "ok"]
     ok = ok[-window:]
     effs = []
     for r in ok:
         try:
-            effs.append(float(r["planner_path_efficiency"]))
+            effs.append(float(r[eff_col]))
         except (KeyError, ValueError, TypeError):
             continue
     efficiency = sum(effs) / len(effs) if effs else 0.0

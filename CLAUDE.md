@@ -8,13 +8,39 @@ TurtleBot3 autonomous navigation using DreamerV3 (model-based RL). The robot rec
 
 **Stage coverage: 1–8 (fully supported).** The goal sampler `_sample_target_position` in `envs/turtle.py` defines start/goal layouts for stages 1–8 (stages 7 and 8 added 2026-06-09; unknown stage → `ValueError`), and the A* arena geometry (`STAGE_ARENAS` in `envs/stage_map.py`) covers 1–8. Each stage needs its own Gazebo launch file (`turtle_stage{N}.py`) and a matching `--stage N`. A thesis-ready methodology and supporting docs live under `docs/` (`methodology.md`, `implementation_audit.md`, `whitebox_data_validation.md`, etc.).
 
-Active development spans several branches: `imu-observation` (current — IMU `full_imu` mode), `reward-shaping-optuna` (BO tuning checkpoint), `depth-perception` (depth camera integration), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
+Active development spans several branches: `path-efficiency-hybrid` (**current** — kinematics/Hybrid-A*/exploration/reward levers; see Current Research Direction below), `reward-pbrs` (potential-based reward shaping) and `reward-shaping` (additive shaping + BO tuning) beneath it, `imu-observation` (IMU `full_imu` mode), `reward-shaping-optuna` (BO tuning checkpoint), `depth-perception` (depth camera integration), `planner-efficiency-metric` (A* metric, dashboard, resource logging), and `odometry-observation` (odometry ablation).
+
+## Current Research Direction
+
+This repository is used for a **DreamerV3 TurtleBot3 ROS2/Gazebo dissertation study**. The work **extends Raul Steinmetz's DreamerV3 TurtleBot3 framework**.
+
+**Framing:**
+- Raul's baseline observation is LiDAR readings + relative goal distance + relative goal angle + previous linear/angular velocity — see [Baseline observation construction](#baseline-observation-construction-envget_state) for the exact formula.
+- Odometry is available internally in ROS2/Gazebo and is already used there to *compute* those pose-derived values (`distance_to_target` / `angle_to_target` are derived from `/odom` pose + yaw).
+- However, odometry was **not isolated as an explicit observation-input ablation** in the original baseline — there was no `odometry_mode` axis testing whether exposing odometry-derived features directly (not only through the derived distance/angle) changes what DreamerV3 can learn.
+- This study extends the baseline by evaluating explicit **odometry-augmented observation modes** (see Odometry Ablation below) as a controlled ablation axis.
+- **This is a design/scope limitation and research gap, not a defect** — the original baseline was not built to answer this specific question; this study exists to answer it. Do not describe Raul's work as wrong, incomplete, or a typographical error.
+
+## Main Experimental Question
+
+Does explicit odometry-augmented observation improve DreamerV3 TurtleBot3 navigation in terms of:
+- learning stability,
+- sample efficiency,
+- success rate,
+- collision/timeout reduction,
+- steps-to-goal,
+- path directness,
+- success-only Hybrid-A* efficiency (`planner_path_efficiency_hybrid`),
+- local efficiency (`local_efficiency`)?
 
 ## Project Branches
 
 | Branch | Purpose |
 |--------|---------|
-| `imu-observation` | **Current active branch** — IMU integration via the `full_imu` odometry mode (`full` + 2D linear acceleration from `/imu`); branched off `reward-shaping-optuna` |
+| `path-efficiency-hybrid` | **Current active branch** — new kinematics default (0.1 m min turn radius), Hybrid-A* nonholonomic path-efficiency metric, `--actor_entropy` exploration lever, BO co-tuning, `local_efficiency` metric, dashboard performance overhaul; branched off `reward-pbrs` |
+| `reward-pbrs` | Potential-based reward shaping (`reward_mode=pbrs`) checkpoint; branched off `reward-shaping` |
+| `reward-shaping` | Additive reward-shaping checkpoint (`reward_mode=shaped`, RS-1…RS-4) + Bayesian-Optimization tuning (`tune_reward.py`); branched off `main` |
+| `imu-observation` | IMU integration via the `full_imu` odometry mode (`full` + 2D linear acceleration from `/imu`); branched off `reward-shaping-optuna` |
 | `reward-shaping-optuna` | BO tuning checkpoint — Optuna reward-weight search; clean checkpoint that IMU and depth branch off |
 | `depth-perception` | Depth camera integration — burger SDF, ROS2 `/camera/depth/image_raw`, obs wiring, CNN encoder |
 | `planner-efficiency-metric` | Upstream baseline — A* metric, path plots, dashboard, resource-cost logging |
@@ -71,6 +97,8 @@ See **Example Commands** for smoke test and full training variants.
 | `full` | (5,) | Both twist and delta combined |
 | `full_imu` | (7,) | `full` (5) **+** `[accel_x, accel_y]` — 2D robot-frame linear acceleration from `/imu` (branch `imu-observation`) |
 
+**`full_imu` is the flagship odometry mode.** `twist` (`odom_linear_x`, `odom_angular_z`) largely duplicates the **commanded** `velocity` observation already present in the baseline (`lin_vel_cmd`/`ang_vel_cmd`), and `delta` is close to that same velocity integrated over one step — both are plausibly redundant with what DreamerV3's RSSM can already infer from consecutive baseline observations. The 2D linear acceleration in `full_imu` is the one addition that is not otherwise recoverable from the baseline signals, so it is the ablation arm most likely to show a genuine effect and the one used for the `_eff` BO study and validation runs below.
+
 Ablation logdir naming convention: `./logdir/stage{N}_{lidar}_{mode}_seed{S}`
 
 Each mode must use a **fresh logdir** — episode archives (`.npz`) and checkpoints are not compatible across modes.
@@ -119,6 +147,67 @@ Columns: `datetime, stage, episode, outcome, start_x, start_y, target_x, target_
 Numeric fields are **blank (empty string)** for non-`ok` rows — never `-1.0` — so pandas/CSV tools treat them as NaN naturally.
 
 **Robot footprint (obstacle inflation) — A\* is not a point robot.** `build_grid` in `stage_map.py` inflates every obstacle **and** the outer walls by `ROBOT_RADIUS = 0.15 m` (= TurtleBot3 Burger footprint ≈ `0.105 m` + `0.045 m` safety margin) at `RESOLUTION = 0.05 m` per cell — the standard configuration-space (Minkowski) approach. So A\* keeps the robot **centre ≥ 0.15 m** from any obstacle and routes through a gap **only if it is wider than ~0.30 m** (2 × radius). Because `0.15 m > ` the real ~`0.105 m` radius, **A\* is more conservative than the physical robot**: any path A\* finds is physically followable (with ~0.045 m clearance), and A\* will **never** squeeze through a gap the robot cannot. In tight layouts (e.g. narrow stage-4 corridors) a passage between ~0.21 m and ~0.30 m is fittable by the real robot but declined by A\* → that episode logs `planner_status = no_path` with blank efficiency (honest missing data, **not** a wrong value, and never an over-optimistic one). To make A\* match the robot more exactly, lower `ROBOT_RADIUS` toward `0.105 m`; the conservative default is preferred so the planned path is guaranteed feasible.
+
+## Path Efficiency (branch: `path-efficiency-hybrid`)
+
+Branched off the `reward-pbrs` checkpoint. **Goal:** actually *raise* path efficiency — the per-`goal_id` data showed it stays **flat even when the same goal repeats 46–142×** (random walk, eff 0.06→0.98 for the *same* start→goal), because (1) the **action space couldn't turn tight** and (2) holonomic grid-A\* unfairly penalised the nonholonomic robot. Four levers address this:
+
+**1. Kinematics (the real lever) — NEW DEFAULT.** `publish_action` now reads `--max_linear_vel` (0.1) and `--max_angular_vel` (**default 1.0**, was hardcoded 0.2). **Min turn radius = `max_linear_vel/max_angular_vel`**, so the default is now **0.1 m** (the robot can near-pivot) instead of **0.5 m** (the wide-arc / CCW-looping cause). ⚠ **This changes the default MDP** — new runs are *not* comparable to old 0.2-rad/s runs; pass `--max_angular_vel 0.2` to reproduce the legacy behaviour or resume an old run. Knobs thread through `make_env → Turtle → Env → init_properties` like the `pbrs_*`/`fixed_goals` knobs.
+
+**2. Hybrid-A\* nonholonomic metric (replaces the never-merged Dubins idea).** `hybrid_astar_plan` in [stage_map.py](dreamerv3-torch/envs/stage_map.py) is a kinodynamic planner: **forward-only curvature-bounded arc primitives + an analytic arc shot + a holonomic-with-obstacles heuristic + memoisation**. It respects the run's min turn radius (`= max_linear_vel/max_angular_vel`) **and** avoids inflated obstacles, so it is a **fair** efficiency denominator on **every** stage and is **(almost) never blank** (unlike the holonomic grid A\*). Four new `planning_*.csv` columns (appended before the trailing `goal_id`): `planned_path_length_hybrid, planner_path_efficiency_hybrid, planner_path_efficiency_hybrid_raw, planner_status_hybrid` (status `ok`/`no_path`/`unsupported_stage`/`planner_error`; blank when not `ok`). On the per-episode PNG it is the **prominent blue solid** path; the holonomic A\* drops to **teal dash-dot**. The grid-A\* `planner_path_efficiency` (region/centre) columns are **unchanged** and kept for comparison. Memoised by discretised `(start, goal, radius)` → O(1) on the repeating goals of fixed/discrete stages. **Forward-only** (no Reeds-Shepp reverse) because `action[0] ≥ 0`.
+
+**3. Exploration — `--actor_entropy`.** Overrides the nested `actor.entropy` coefficient (default `3e-4`) when `≥ 0`; sentinel `-1.0` = untouched. Injected in `dreamer.py main()` before the agent is built (no `models.py` change). Higher = sustained exploration → delays the `actor_entropy` collapse that locks the policy into one (non-shortest) mode.
+
+**4. Incentive — step/turn penalty (already a `shaped` knob).** The efficiency lever that actually makes a shorter/straighter path *optimal*. **PBRS cannot do this:** it is **policy-invariant by design** (Ng, Harada & Russell 1999) — it *provably* does not change which policy is optimal, only speeds credit assignment. That is exactly why PBRS (and mild BO) "barely moved efficiency." The **non-invariant** `reward_step_penalty` / `reward_turn_penalty` (shaped mode, RS-2/RS-3) reshape the optimal policy toward fewer steps / less turning.
+
+**BO co-tunes 3 + 4.** `tune_reward.py` `SEARCH_SPACE` now includes `actor_entropy` (log 1e-4–1e-2) and **widens** step/turn to 0–0.1 (was 0–0.05); the generic builder emits `--actor_entropy` with no special-casing. **Scoring switched to `planner_path_efficiency_hybrid`** (`score_run`) — fair and never blank — with fallback to holonomic `planner_path_efficiency` on pre-Hybrid CSVs. Start a **fresh study name** (e.g. `reward_stage1_none_eff`) since the search space changed. Trials inherit the new 1.0-rad/s default; `max_angular_vel` is **not** searched (fixed MDP axis).
+
+**Success criterion:** on a fixed-goal run, per-`goal_id` `planner_path_efficiency_hybrid` shows a **positive first→last trend** and **lower same-goal variance** (the agent *learns* the short path), with `success_rate`/`collision_rate` not regressing — visible in the dashboard's per-goal learning section.
+
+**5. `local_efficiency` — mapless diagnostic metric.** `local_efficiency = (initial_distance − final_distance_to_goal) / path_length`, clamped to `[-1, 1]` (`0.0` if `path_length ≤ 0`). Computed in `get_reward_and_done()` (`envs/turtle.py`) from the same relative-goal-distance values already in the observation — no A\*/map lookup, so it stays valid for unknown/partially-observable environments. Logged as a new `blackbox_{run_name}.csv` column, placed immediately before the trailing `goal_id` (see [CSV logging](#csv-logging) — the column count changed 17→18). **Diagnostic only — it is not read back into `get_state()` or the reward computation, and must not be used as a reward term unless that is an explicit, separately-scoped change.**
+
+### PBRS status
+
+PBRS (`reward_mode=pbrs`) was implemented and evaluated (see [Relative Distance and Angular PBRS](#relative-distance-and-angular-pbrs-reward_modepbrs) below). It is **valid as reward shaping** — it densifies the reward signal and speeds credit assignment toward the goal — but it is **not expected to directly improve path efficiency**, because it is **policy-invariant by design** (Ng, Harada & Russell 1999; see Lever 4 above): it provably preserves the optimal-policy structure of the underlying sparse reward rather than reshaping it, and its per-episode magnitude is small relative to the ±terminal reward. That is why PBRS runs and mild-range BO both "barely moved efficiency" — this is the expected behaviour of a policy-invariant shaping term, not a failure of the implementation.
+
+### `_eff` BO study — status (preliminary)
+
+`tune_reward.py` study `reward_stage4_full_imu_eff` (stage 4, `full_imu`, the widened search space from Lever "BO co-tunes 3 + 4" above): **109 trials** (86 `COMPLETE` / 3 `FAIL` / 20 `RUNNING`). Best **feasible** trial = **trial034** — hybrid efficiency **0.7647**, success **96.7%** (exact parameters in [Validation Protocol](#validation-protocol) below). **This is a preliminary candidate from constrained-search-space selection, not proof that the configuration generalizes** — it has not yet been run at full training budget on a fresh logdir. Treat it as "best candidate to validate," not "confirmed improvement," until the Validation Protocol below is completed and its success criteria are checked.
+
+## Validation Protocol
+
+Declares whether the `_eff` BO winner (trial034) is an actual improvement, not just a good proxy-budget score.
+
+**A. Full-budget validation of trial034's tuned reward.** Stage 4, lidar 360, `odometry_mode full_imu`, seed 0, `steps 300000`, `eval_episode_num 100`, `reward_mode shaped`, fixed goals `2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0` (so the per-`goal_id` learning trend from the Path Efficiency success criterion is checkable). Trial034 parameters:
+
+| Flag | Value |
+|---|---|
+| `--reward_progress_scale` | `1.73768` |
+| `--reward_step_penalty` | `0.037479` |
+| `--reward_turn_penalty` | `0.0160898` |
+| `--reward_near_obstacle_scale` | `0.000422429` |
+| `--reward_near_obstacle_sigma` | `0.454763` |
+| `--actor_entropy` | `0.000102611` |
+
+Ready-to-run command in [Example Commands](#example-commands).
+
+**B. A/B comparison arm.** Identical setup — same seed, same steps, same fixed goals, `odometry_mode full_imu` — but `reward_mode default` (no tuned weights) and a **fresh logdir**. This isolates what the tuned reward adds on top of the same odometry mode and kinematics.
+
+**C. Generalization check (recommended).** Re-run (A) with random goals or a held-out fixed-goal set not used during BO/validation. **Do not overclaim the fixed-goal result as a general navigation improvement** unless it also holds on random/unseen goals — the fixed-goal protocol is a controlled learning-trend check, not evidence of generalization by itself.
+
+## Metrics for Final Analysis
+
+**Primary metrics come from evaluation CSVs (`*_eval_*`), not training logs** — training uses the stochastic actor and is noisier; eval uses the deterministic policy and is the authoritative source (see [CSV logging](#csv-logging) `eval_success_rate`/`eval_collision_rate` note). Use, filtered to **success-only** where noted:
+- eval success rate
+- eval collision rate
+- eval timeout rate
+- eval steps-to-goal
+- eval success-rate AUC
+- eval success-only `path_directness`
+- eval success-only `planner_path_efficiency_hybrid`
+- eval `local_efficiency`
+
+Training logs (`blackbox_{run}.csv`, `whitebox_{run}.csv`) are for **debugging and learning-behavior diagnostics only** (e.g. `actor_entropy` collapse, loss curves) — not for reporting final results. See also [Metric Interpretation](#metric-interpretation).
 
 ## Reward Shaping (branch: `reward-shaping`)
 
@@ -225,13 +314,13 @@ Compare against a no-shaping baseline run on this branch for the same stage (not
 | `none` (default) | `reward_stage{N}_none` / `tune_reward_stage{N}_none.db` | `csv_logs/tune_stage{N}_none/` | `logdir/reward_stage{N}_none/…` |
 | `full_imu` | `reward_stage{N}_full_imu` / `tune_reward_stage{N}_full_imu.db` | `csv_logs/tune_stage{N}_full_imu/` | `logdir/reward_stage{N}_full_imu/…` |
 
-`export_tune_results.py` takes the same `--odometry-mode` flag so a standalone export targets the matching mode-namespaced study. **Note:** pre-existing `none` studies/folders from before this change used the un-suffixed names (`tune_stage{N}`, `tune_reward_stage{N}.db`); migrate them to the `_none` names to resume, or pass `--study-name` / `--csv-dir` / `--storage` explicitly.
+`export_tune_results.py` takes the same `--odometry-mode` flag so a standalone export targets the matching mode-namespaced study. **Note:** pre-existing `none` studies/folders from before this change used the un-suffixed names (`tune_stage{N}`, `tune_reward_stage{N}.db`); migrate them to the `_none` names to resume, or pass `--study-name` / `--csv-dir` / `--storage` explicitly. `--actor_entropy` is now included in both the exported `tune_trials_stage{N}.csv` columns and the printed "validation flags" (`REWARD_KEYS` in `export_tune_results.py`) — it was previously missing from both.
 
-- **Objective (constrained efficiency):** maximize eval `planner_path_efficiency` subject to eval `success_rate ≥ baseline_success − margin` (default margin 5 pts). Constraint handled via `TPESampler(constraints_func=...)`.
+- **Objective (constrained efficiency):** maximize eval `planner_path_efficiency_hybrid` (the fair Hybrid-A\* metric; falls back to holonomic `planner_path_efficiency` on pre-Hybrid CSVs) subject to eval `success_rate ≥ baseline_success − margin` (default margin 5 pts). Constraint handled via `TPESampler(constraints_func=...)`.
 - **Fidelity:** short proxy budget per trial (`--steps 80000 --eval_episode_num 20`), then validate the winner at full budget. Trials run **sequentially** (one Gazebo, one GPU). At the default `eval_every = 20000`, an **80k** trial yields **5 evals → ~100 eval episodes**, and `SCORE_WINDOW = 60` scores the **last 3 evals** (the 40k/60k/80k checkpoints), excluding the untrained `ctr=0` eval. **Use `--steps ≥80000` for BO:** a 40k trial has only 3 evals (60 rows), so the 60-row window would reach the untrained `ctr=0` eval and pollute the score (for short trials, lower `SCORE_WINDOW`). `tune_reward.py` does not expose `--eval_every`, so trials use the config default. See [docs/evaluation_loop.md](docs/evaluation_loop.md).
 - **Persistence:** study saved to `tune_reward_stage{N}_{mode}.db` (sqlite, gitignored) with `load_if_exists=True` — a crash/reboot resumes the study.
 
-**`tune_reward.py` does not replace `dreamer.py` — it wraps it.** Each trial builds and runs a normal `dreamer.py ... --reward_mode shaped` command with the five `--reward_*` flags chosen by Optuna. A plain `dreamer.py` run (no weight flags) is still the way to do smoke tests, the baseline, and final validation.
+**`tune_reward.py` does not replace `dreamer.py` — it wraps it.** Each trial builds and runs a normal `dreamer.py ... --reward_mode shaped` command with the six Optuna-chosen flags — the five `--reward_*` weights **plus `--actor_entropy`** (exploration). A plain `dreamer.py` run (no weight flags) is still the way to do smoke tests, the baseline, and final validation.
 
 #### How to run the BO search
 
@@ -240,7 +329,7 @@ Needs **two terminals**.
 **Terminal 1 — start Gazebo once** (stays up for the entire study; the stage is fixed):
 ```bash
 export TURTLEBOT3_MODEL=burger
-ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py
+ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py gui:=false
 ```
 
 **Terminal 2 — run the tuner:**
@@ -248,15 +337,26 @@ ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage1.py
 cd ~/turtlebot-dreamerv3/dreamerv3-torch
 
 # (optional) preview the exact dreamer.py commands — no training, no Gazebo needed
-python3 tune_reward.py --stage 1 --n-trials 2 --dry-run
+python3 tune_reward.py --stage 1 --n-trials 2 --dry-run --study-name reward_stage1_none_eff
 
-# 1) default-reward baseline → sets the success-rate constraint floor
-python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20
+# 1) default-reward baseline → sets the success-rate constraint floor (new kinematics)
+python3 tune_reward.py --stage 1 --run-baseline --steps 80000 --eval-episode-num 20 \
+  --study-name reward_stage1_none_eff
 
-# 2) the search: 30 trials, each an 80k-step run with Optuna-chosen weights
+# 2) the search: 40 trials, each an 80k-step run with Optuna-chosen weights
 #    (auto-runs a baseline first if --baseline-success is not given)
-python3 tune_reward.py --stage 1 --n-trials 30 --steps 80000 --eval-episode-num 20
+python3 tune_reward.py --stage 1 --n-trials 40 --steps 80000 --eval-episode-num 20 \
+  --study-name reward_stage1_none_eff
 ```
+
+> **Updated search space (branch `path-efficiency-hybrid`):** the BO now **co-tunes
+> `actor_entropy`** (log `1e-4`–`1e-2`, exploration) alongside the reward weights, with
+> **step/turn penalty widened to `0`–`0.1`** (was `0`–`0.05`). It **scores on
+> `planner_path_efficiency_hybrid`** (the fair nonholonomic Hybrid-A\* metric, never
+> blank), and trials inherit the **new `1.0`-rad/s kinematics default**. ⚠ **Use a fresh
+> `--study-name`** (e.g. `reward_stage1_none_eff`) — the search space gained a dimension,
+> so resuming an old study would corrupt its TPE model. `max_angular_vel` is **not**
+> searched (a fixed MDP axis).
 
 > **Why `--steps 80000` (not 40k):** with `eval_every = 20000` and `SCORE_WINDOW = 60`,
 > an 80k trial has 5 evals (100 rows) and the score uses the **last 3 trained evals**
@@ -282,7 +382,7 @@ Key flags: `--stage`, `--odometry-mode` (default `none`; non-`none` namespaces t
 > rm -rf logdir/smoke/ csv_logs/tune_stage1_none/
 > ```
 
-**Validation protocol (declares the winner):** take the printed weights and re-run at **full budget** with `dreamer.py` directly — 3 seeds on stage 1, then stages 2–4 with the same weights to test transfer:
+**Validation protocol (declares the winner):** take the printed weights (now **including `--actor_entropy`**) and re-run at **full budget** with `dreamer.py` directly — 3 seeds on stage 1, then stages 2–4 with the same weights to test transfer. The validation inherits the new `1.0`-rad/s kinematics (the BO trials ran on it); use a **fixed-goal** stage so the per-`goal_id` learning trend is the success check:
 ```bash
 python3 dreamer.py --configs turtle --task turtle \
   --logdir ./logdir/stage1_360_none_seed0_reward_tuned \
@@ -290,7 +390,8 @@ python3 dreamer.py --configs turtle --task turtle \
   --device cuda --steps 300000 --eval_episode_num 100 \
   --reward_mode shaped \
   --reward_progress_scale <v> --reward_step_penalty <v> --reward_turn_penalty <v> \
-  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
+  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v> \
+  --actor_entropy <v>
 ```
 A single 40k proxy trial only *ranks* configs; the full-budget multi-seed run *confirms* the winner.
 
@@ -337,6 +438,22 @@ streamlit run app.py
 ```
 
 Every `st.plotly_chart` / `st.dataframe` in the per-run sections (`_section_resource`, `_section_planner`) and the combined sections (`_section_bb`, `_section_wb`) passes a unique `key=` (e.g. `res_{run_name}_{y_col}`, `plan_{run_name}`, `bb_{col}`, `wb_{title}`). This avoids `StreamlitDuplicateElementId` when multiple runs are selected and rendered in a loop — **add a unique `key=` to any new chart/table** you introduce in those loops.
+
+`local_efficiency` is selectable in the per-goal learning metric picker (`_GOAL_METRICS`) once a run's CSVs contain it.
+
+### Performance (branch: `path-efficiency-hybrid`)
+
+The dashboard was slow / could hang the browser, worst during active BO sweeps (many trials × multi-thousand-row CSVs). Fixed, dashboard-only, no training-pipeline change:
+
+- **`st.tabs()` → `st.radio()` page-selector.** Streamlit reruns the whole script on every interaction and `st.tabs()` executes **every** tab's body regardless of which is visually open; a `st.radio(..., key="main_view")` page-selector makes only the selected page's code run (true lazy loading) — the un-selected branches are plain `elif`s that never execute.
+- **BO trial loading is filtered *before* the per-trial CSV reads**, not after — a trial-state (default `COMPLETE`) + "last N" filter narrows which trials' `planning_*`/`blackbox_*` CSVs get loaded at all, instead of loading every trial in the study (previously up to ~218 reads / ~229k chart points by default) and only filtering what got *plotted*.
+- **Row caps** (`tail(50)` default, opt-out checkbox) on the three largest raw tables: Blackbox episode log, Resource raw log, Planning Log.
+- **Chart downsampling** (`_thin`) above 2,000 points on raw scatter/marker traces — rolling-mean trend lines are always computed on the full series first, then thinned the same way, so trend shape is unaffected.
+- **Auto-refresh no longer force-clears the whole cache** every cycle — relies on the existing `CACHE_TTL` (20 s) instead. The manual "⟳ Refresh now" button still does a full clear (explicit one-shot action).
+- **Folder-switch cache-clear is scoped** to just the loaders that read the global `CSV_DIR` (`scan_runs`, `load_bb`, `load_wb`, `load_pl`, `load_resource`, `load_resource_eval`, `load_tune_trials`), not a blanket `st.cache_data.clear()`.
+- **"Exclude invalid/incomplete rows" toggles** added to the Blackbox table, Planning Log table, and BO leaderboard (hide `RUNNING`/`FAIL` trials, non-`ok` planner rows).
+
+None of this changes any metric/formula — purely how much is loaded/rendered. See Safety Rules below for dashboard-during-training guidance.
 
 ## Gazebo Launch Notes
 
@@ -409,6 +526,47 @@ Expected: numpy 2.x, matplotlib from `~/.local/`, CUDA True, RTX 5060 Ti.
 
 ## Example Commands
 
+> **⚠ Kinematics default (branch `path-efficiency-hybrid`):** all commands below now run at
+> **`max_angular_vel = 1.0` rad/s** (min turn radius `0.1/1.0 = 0.1 m`) by default — the robot can
+> near-pivot. This is a **different MDP** from the old `0.2`-rad/s (radius `0.5 m`) runs; add
+> **`--max_angular_vel 0.2`** to reproduce the legacy behaviour / resume an old run, or to run the
+> kinematics A/B. Path efficiency is now also reported as `planner_path_efficiency_hybrid` (the fair
+> nonholonomic Hybrid-A\* metric — blue path on every PNG).
+
+### Current commands — Validation Protocol (trial034), the recommended next run
+
+**Terminal 1 — Gazebo, stage 4, headless:**
+```bash
+export TURTLEBOT3_MODEL=burger
+ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage4.py gui:=false
+```
+
+**Terminal 2A — full-budget validation of trial034 (Validation Protocol A):**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage4_360_full_imu_seed0_eff_tuned_fixedgoal \
+  --stage 4 --lidar 360 --odometry_mode full_imu --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode shaped \
+  --reward_progress_scale 1.73768 --reward_step_penalty 0.037479 \
+  --reward_turn_penalty 0.0160898 --reward_near_obstacle_scale 0.000422429 \
+  --reward_near_obstacle_sigma 0.454763 --actor_entropy 0.000102611 \
+  --fixed_goals "2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0"
+```
+
+**Terminal 2B — A/B comparison arm, default reward (Validation Protocol B), run after 2A:**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage4_360_full_imu_seed0_default_fixedgoal \
+  --stage 4 --lidar 360 --odometry_mode full_imu --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 \
+  --reward_mode default \
+  --fixed_goals "2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0"
+```
+See [Validation Protocol](#validation-protocol) for the full A/B/C description and success criteria.
+
 **Smoke test (any stage N):**
 ```bash
 cd ~/turtlebot-dreamerv3/dreamerv3-torch
@@ -418,6 +576,22 @@ python3 dreamer.py \
   --logdir ./logdir/gpu_smoke_stage{n}_none_seed0 \
   --stage {n} --lidar 360 --odometry_mode none --seed 0 \
   --device cuda --steps 5000 --eval_episode_num 2
+```
+
+**Kinematics A/B (the headline lever) — new default vs legacy:**
+```bash
+cd ~/turtlebot-dreamerv3/dreamerv3-torch
+# NEW default kinematics (1.0 rad/s, radius 0.1 m) — no flag needed
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_default_ang10 \
+  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 --reward_mode default
+# LEGACY kinematics (0.2 rad/s, radius 0.5 m) — the old looping setup
+python3 dreamer.py --configs turtle --task turtle \
+  --logdir ./logdir/stage{n}_360_none_seed0_reward_default_ang02 \
+  --stage {n} --lidar 360 --odometry_mode none --seed 0 \
+  --device cuda --steps 300000 --eval_episode_num 100 --reward_mode default \
+  --max_angular_vel 0.2
 ```
 
 **GPU training — default reward (original sparse reward, baseline):**
@@ -455,7 +629,8 @@ python3 dreamer.py \
   --device cuda --steps 300000 --eval_episode_num 100 \
   --reward_mode shaped \
   --reward_progress_scale <v> --reward_step_penalty <v> --reward_turn_penalty <v> \
-  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v>
+  --reward_near_obstacle_scale <v> --reward_near_obstacle_sigma <v> \
+  --actor_entropy <v>
 ```
 
 **GPU training — PBRS reward (branch `reward-pbrs`):**
@@ -509,6 +684,14 @@ Custom CSV output directory (e.g. to keep BO validation runs separate from tune 
 ```
 
 Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, `full`, or `full_imu` as needed.
+
+## Safety Rules
+
+- **Use a fresh logdir for any run after the `local_efficiency` CSV schema update.** The blackbox CSV header changed 17 → 18 columns (see [CSV logging](#csv-logging)) — **do not resume an old logdir**; an old 17-column CSV appended with new 18-field rows is a mismatch.
+- **Never commit** `logdir/`, `csv_logs/`, Optuna databases, checkpoints, `.npz`, `.pt`, `.pth`, or other large generated result files unless explicitly requested — see [Git Rules](#git-rules) below for the full exclusion list.
+- **Avoid running the Streamlit dashboard during heavy 300k-step training** unless actually needed — prefer `export_tune_results.py` / terminal CSV checks while training is running, and open the dashboard afterward (see [Monitoring](#monitoring-streamlit-dashboard) → Performance).
+- **A\*/Hybrid-A\* must remain a post-hoc/reference metric only** — never a planner during DreamerV3 training or execution (see [A\* Planner-Based Path Efficiency](#a-planner-based-path-efficiency): *"This is a post-hoc evaluation metric — it does not change reward, observation space, odometry modes, model architecture, or training logic."*).
+- **Do not implement a genetic algorithm or any new major hybrid planner** unless explicitly approved and scoped.
 
 ## Git Rules
 
@@ -589,9 +772,13 @@ Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.cs
 | `resource_{run_name}.csv` | Train env | Resource cost (on by default; `--resource_logging False` to disable) |
 | `resource_eval_{run_name}.csv` | Eval env | Resource cost for eval (same flag) |
 
-**`blackbox_*` columns:** `datetime, odometry_mode, stage, episode, outcome, steps_to_goal, path_directness, min_obstacle_dist, near_collisions, success_rate, collision_rate, rolling_success_rate_100, rolling_collision_rate_100, rolling_success_rate_500, rolling_collision_rate_500, episode_steps`. Episode numbering and rolling-window counters in each CSV are independent — cumulative rates and rolling rates in `blackbox_eval_*` reflect eval-only performance across all checkpoints.
+**`blackbox_*` columns (18 total):** `datetime, odometry_mode, stage, episode, outcome, steps_to_goal, path_directness, min_obstacle_dist, near_collisions, success_rate, collision_rate, rolling_success_rate_100, rolling_collision_rate_100, rolling_success_rate_500, rolling_collision_rate_500, episode_steps, local_efficiency, goal_id`. Episode numbering and rolling-window counters in each CSV are independent — cumulative rates and rolling rates in `blackbox_eval_*` reflect eval-only performance across all checkpoints.
 
 > **`steps_to_goal` vs `episode_steps`:** `steps_to_goal` is the step count for **successful** episodes only (`-1` for collision/timeout — kept for backward compatibility). `episode_steps` (added 2026-06-12) is the total step count for **every** outcome: for `collision` rows it is the **time-to-collision**, for `timeout` it is ~`max_steps` (250), and for `success` it equals `steps_to_goal`. Combined with `actual_path_length` (planning CSV) it gives per-episode average speed (`m/step`) for any outcome. Read it by column name — CSVs written before the column was added simply lack the field.
+>
+> **`goal_id`** (added on the `reward-pbrs` checkpoint) — a coordinate-derived tag (`f"{target_x:+.2f}_{target_y:+.2f}"`), stable across runs/modes, letting the dashboard group/compare episodes by the *same* start→goal pair (most useful under `--fixed_goals` or on the discrete-goal stages where coordinates repeat).
+>
+> **`local_efficiency`** (added 2026-08-08, branch `path-efficiency-hybrid`) — `(initial_distance − final_distance_to_goal) / path_length`, clamped `[-1, 1]`; mapless diagnostic metric, not a reward term (see [Path Efficiency](#path-efficiency-branch-path-efficiency-hybrid)). **⚠ Schema change: 17 → 18 columns.** A CSV/logdir from before this column existed has 17 columns; resuming that logdir with the current code appends 18-field rows under a 17-column header — a mismatch. **Use a fresh logdir**, don't resume an old one across this change (see Safety Rules).
 
 **`whitebox_{run_name}.csv` columns:** `datetime, step, train_return, reward_variance, model_loss, actor_loss, value_loss, kl, prior_ent, post_ent, eval_return, eval_success_rate, eval_collision_rate, reward_variance_100, actor_entropy, model_grad_norm, actor_grad_norm, value_grad_norm, reward_loss, dyn_loss, rep_loss, ema_005, ema_095`
 
@@ -630,7 +817,8 @@ Nine CSV files per run, written under `dreamerv3-torch/csv_logs/` (or `config.cs
 ## Metric Interpretation
 
 - `path_directness` in `blackbox_{run_name}.csv` is a coarse metric: `initial_distance / actual_path_length`. It does not account for obstacle detours and is not the thesis-grade path efficiency measure.
-- **A* planner-based `planner_path_efficiency`** is the stronger final path-quality metric — it compares the robot's actual path against the optimal A* path for each episode's specific start/goal pair.
+- **`planner_path_efficiency_hybrid` (Hybrid-A\*) is now the strongest path-quality metric** — nonholonomic (respects the robot's min turn radius) and obstacle-aware, valid on every stage and (almost) never blank. The plain grid-A\* `planner_path_efficiency` is holonomic (unfairly penalises the nonholonomic robot) and kept only for comparison — prefer the `_hybrid` column for reported results.
+- **`local_efficiency`** (`blackbox_{run_name}.csv`) is a third, mapless per-episode metric (goal-distance reduction per metre travelled, clamped `[-1, 1]`) — diagnostic only, computed with no A\*/map lookup, useful when comparing behaviour across unknown-map settings where a planner-based metric isn't meaningful.
 - If success rate improves but planner path efficiency remains low, treat it as a valid research finding: DreamerV3 may learn goal-reaching behavior without learning shortest-path behavior.
 
 ## Resource-Cost Logging
