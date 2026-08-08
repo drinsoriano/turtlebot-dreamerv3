@@ -218,6 +218,8 @@ def simulate(
     steps=0,
     episodes=0,
     state=None,
+    checkpoint_every=0,
+    checkpoint_fn=None,
 ):
     if is_eval:
         eval_rwds = []
@@ -232,6 +234,14 @@ def simulate(
     else:
         step, episode, done, length, obs, agent_state, reward = state
     i = 0
+    # Optional periodic checkpoint hook (checkpoint_every>0 + checkpoint_fn set).
+    # Fires between while-loop iterations below — see the call site at the end of
+    # the loop body for the non-invasiveness contract. Inert (None) for every call
+    # site that doesn't pass these (eval, prefill, and training when
+    # --checkpoint_every 0).
+    _next_checkpoint_at = (step + checkpoint_every
+                            if (checkpoint_fn is not None and checkpoint_every > 0)
+                            else None)
     while (steps and step < steps) or (episodes and episode < episodes): # episode < 1000?
         i += 1
         start_time = time.time()
@@ -383,6 +393,18 @@ def simulate(
         if is_eval and i % 2 == 0:
             elapsed = time.time() - start_time
             time.sleep(0.3 - elapsed if elapsed < 0.3 else 0)
+
+        # Optional periodic checkpoint hook (checkpoint_every>0 + checkpoint_fn
+        # set). Fires between iterations only — never touches done/length/obs/
+        # agent_state/episode/step, never resets an env, never truncates a
+        # trajectory, never re-inits the RSSM latent. Purely an extra side effect
+        # (saving an already-in-memory snapshot of agent weights) layered on top
+        # of the untouched simulation loop. Inert (this whole block never runs)
+        # when checkpoint_fn is None, which is every call site except training
+        # with --checkpoint_every > 0.
+        if _next_checkpoint_at is not None and step >= _next_checkpoint_at:
+            checkpoint_fn()
+            _next_checkpoint_at += checkpoint_every
     if is_eval:
         return eval_rwds
     else:
@@ -438,6 +460,57 @@ def convert(value, precision=32):
     else:
         raise NotImplementedError(value.dtype)
     return value.astype(dtype)
+
+
+def validate_episode_file(path):
+    """Cheaply validate a saved episode .npz: non-empty, opens as a valid npz
+    archive, and contains a 'reward' array. Only decompresses the small 'reward'
+    array (not the full episode), so this is cheap even at thousands of files.
+    Used by count_steps() so a corrupt/truncated file (e.g. from a process killed
+    mid-write) is excluded from the step count instead of silently inflating it
+    relative to what load_episodes() actually loads.
+
+    NOTE: scripts/scan_corrupt_episodes.py duplicates this exact check (torch-free,
+    for fast standalone CLI use) — keep both in sync if the criteria change.
+
+    Returns (ok: bool, length: int|None, error: str|None).
+    """
+    path = pathlib.Path(path)
+    try:
+        if path.stat().st_size == 0:
+            return False, None, "0-byte file"
+        with path.open("rb") as f:
+            with np.load(f) as npz:
+                if "reward" not in npz.files:
+                    return False, None, "missing 'reward' key"
+                length = len(npz["reward"])
+        return True, length, None
+    except Exception as e:
+        return False, None, str(e)
+
+
+def atomic_torch_save(obj, path, keep_backup=False):
+    """Write a torch checkpoint atomically: write to a same-directory `.tmp` file,
+    flush+fsync, optionally rotate the existing file to a `_prev` backup, then
+    os.replace the tmp into place. Prevents an unloadable truncated checkpoint if
+    the process dies mid-write (power loss / hard hang) — a prior run in this repo
+    (logdir/reward_stage1/reward_stage1_trial023/latest.pt) hit exactly this failure
+    mode. tmp/backup/target are always in the same directory, so os.replace is
+    atomic (same filesystem) in both steps.
+    """
+    path = pathlib.Path(path)
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        torch.save(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    if keep_backup and path.exists():
+        backup = path.parent / (path.stem + "_prev" + path.suffix)
+        try:
+            os.replace(path, backup)
+        except OSError as e:
+            print(f"[checkpoint] Warning: could not preserve backup {backup}: {e}")
+    os.replace(tmp, path)
 
 
 def save_episodes(directory, episodes):

@@ -524,6 +524,80 @@ Expected: numpy 2.x, matplotlib from `~/.local/`, CUDA True, RTX 5060 Ti.
   - `100` — preferred for real training and final result reporting
 - **Eval overhead on long runs:** at the default `eval_every = 20000`, a 300k run is ~16 evals and a 600k run is ~31 evals. At `--eval_episode_num 100` that is ~1,600–3,100 eval episodes (and eval path-plots). Cut it further with a smaller `--eval_episode_num` and/or a larger `--eval_every`; conversely, lower `--eval_every` for a finer curve on short runs.
 
+## Crash-Safe Manual Resume Workflow
+
+Training does **not** auto-restart after a reboot, hang, or power loss — there is no
+systemd/cron/tmux/watchdog anywhere in this repo. **To continue, manually rerun the
+exact same `dreamer.py` command with the same `--logdir`.** DreamerV3 resumes from
+`latest.pt` + the replay `.npz` episodes already on disk; the step counter is
+recomputed from the episode files, not the checkpoint.
+
+**What's hardened (branch `path-efficiency-hybrid`):**
+
+| Risk (pre-hardening) | Fix |
+|---|---|
+| `latest.pt` written directly — a crash mid-write leaves an unloadable file | `tools.atomic_torch_save()`: write to `latest.pt.tmp`, `fsync`, `os.replace()` into place. Same for `best.pt` (no backup rotation — nothing loads `best.pt` at startup) |
+| No backup if `latest.pt` itself is corrupt | Previous good `latest.pt` is rotated to `latest_prev.pt` before the new one is promoted |
+| Checkpoint load had no try/except — a corrupt file crashed with a raw traceback | `--resume_policy` (`auto`/`strict`/`fresh`) governs a clear fallback chain; failures `sys.exit()` with an explanatory message, never a stack trace |
+| `count_steps()` trusted `.npz` filenames blindly — a corrupt file with a valid-looking name silently inflated the step count vs. what `load_episodes` actually loads | Now opens each file and validates a `reward` key before trusting its length; corrupt files are excluded and reported |
+| Checkpoint only saved once per `eval_every` (default 20000 steps) — a crash could lose up to that much progress | `--checkpoint_every` triggers extra saves via a callback hook **inside** `tools.simulate()` |
+
+**`--resume_policy` (default `auto`):**
+- `auto` — try `latest.pt`, fall back to `latest_prev.pt` if corrupt/missing, abort clearly if both fail.
+- `strict` — try `latest.pt` only; abort if it exists but fails to load (no backup fallback).
+- `fresh` — skip checkpoint loading. If the logdir already has a checkpoint or replay episodes, refuses to proceed silently — pass `--confirm_fresh` to override. (Replay episodes already in `train_eps/` are still counted/replayed even under `fresh` — this flag only controls whether the *model weights* start over. Use a new `--logdir` for a fully clean run.)
+
+**`--checkpoint_every` (default `10000`):** Saves `latest.pt` every N steps during
+training, independent of `--eval_every` (default 20000). Implemented as an optional
+callback hook **inside** `tools.simulate()`'s existing while-loop — it fires between
+iterations without touching `done`/`length`/`obs`/`agent_state`/`episode`/`step`, so
+it adds **no new env reset, no RSSM-latent reinit, no episode truncation** at any
+interval (unlike naively calling `tools.simulate()` more often, which would have —
+`tools.simulate()` does not thread state across *separate* calls in training mode,
+a pre-existing characteristic; the hook avoids that pitfall entirely by never
+creating a new call boundary). `0` disables it (checkpoint only at the existing
+`eval_every` boundary, identical to pre-hardening cadence). Every checkpoint save
+prints `[checkpoint] saved latest.pt at step {step}`.
+
+**Resume event log:** every process start appends one row to
+`{logdir}/resume_events.csv` (`datetime, resume_policy, checkpoint_loaded, step,
+replay_episodes_loaded, corrupt_episodes_skipped`) — a quick breadcrumb of every
+resume without cross-referencing timestamps across the other CSVs. Lives in
+`logdir/` (gitignored), not `csv_dir/`, since it's a per-run breadcrumb, not a metric.
+
+**After a crash, before resuming:**
+
+1. **Scan for corrupt episode files** (read-only by default):
+   ```bash
+   python3 scripts/scan_corrupt_episodes.py --logdir ./logdir/stage4_360_full_imu_seed0_eff_tuned_fixedgoal_v2
+   ```
+   Add `--clean_corrupt_eps` only if you want them removed (prints exactly which files, before removing).
+
+2. **Repair NUL-padded CSVs** if the dashboard or pandas complains about a crash-affected run (dry run first, `--apply` to actually fix; always makes a `.bak`):
+   ```bash
+   python3 scripts/repair_csv_nuls.py --csv-dir ./csv_logs/full_imu_stage4
+   python3 scripts/repair_csv_nuls.py --csv-dir ./csv_logs/full_imu_stage4 --apply
+   ```
+   Only strips a *pure* run of trailing NUL bytes after the last newline — a genuinely incomplete/partial last row is left untouched and reported for manual inspection, never reinterpreted.
+
+3. **Resume** — rerun the original command unchanged:
+   ```bash
+   python3 dreamer.py --configs turtle --task turtle --logdir <same as before> ... (all original flags)
+   ```
+
+**Manual resume is acceptable** for long practical training runs, debugging, and
+salvaging progress after a crash. **Fresh logdirs are still preferred for final
+thesis A/B validation** when feasible (see [Validation Protocol](#validation-protocol)
+and [Safety Rules](#safety-rules)) — a resumed run carries a discontinuity (weights
+rewound to the last checkpoint while the replay buffer keeps newer episodes) that a
+clean run doesn't have, which matters when the run is the headline comparison, not
+when it's practical/debugging work.
+
+**Never commit** `logdir/`, `csv_logs/`, `path_plots/`, `*.db`, `*.npz`, `*.pt`,
+`*.pth`, `latest.pt.tmp`, `latest_prev.pt`, `.bak` files, or other generated output
+(see [Git Rules](#git-rules)) — all already covered by the existing `logdir/`/
+`csv_logs/` gitignore rules since these new files live inside those trees.
+
 ## Example Commands
 
 > **⚠ Kinematics default (branch `path-efficiency-hybrid`):** all commands below now run at
@@ -688,6 +762,7 @@ Replace `{n}` with the stage number (1–8) and `none` with `twist`, `delta`, `f
 ## Safety Rules
 
 - **Use a fresh logdir for any run after the `local_efficiency` CSV schema update.** The blackbox CSV header changed 17 → 18 columns (see [CSV logging](#csv-logging)) — **do not resume an old logdir**; an old 17-column CSV appended with new 18-field rows is a mismatch.
+- **Training does not auto-resume after a crash/reboot** — see [Crash-Safe Manual Resume Workflow](#crash-safe-manual-resume-workflow) for the manual resume procedure and safety knobs (`--resume_policy`, `--checkpoint_every`).
 - **Never commit** `logdir/`, `csv_logs/`, Optuna databases, checkpoints, `.npz`, `.pt`, `.pth`, or other large generated result files unless explicitly requested — see [Git Rules](#git-rules) below for the full exclusion list.
 - **Avoid running the Streamlit dashboard during heavy 300k-step training** unless actually needed — prefer `export_tune_results.py` / terminal CSV checks while training is running, and open the dashboard afterward (see [Monitoring](#monitoring-streamlit-dashboard) → Performance).
 - **A\*/Hybrid-A\* must remain a post-hoc/reference metric only** — never a planner during DreamerV3 training or execution (see [A\* Planner-Based Path Efficiency](#a-planner-based-path-efficiency): *"This is a post-hoc evaluation metric — it does not change reward, observation space, odometry modes, model architecture, or training logic."*).

@@ -26,6 +26,17 @@ defaults:
   csv_dir: './csv_logs'             # base dir for all per-run CSVs (BO trials use a subfolder)
   plots_dir: './path_plots'         # base dir for path-plot PNGs (BO trials use a subfolder)
 
+  # Crash-safe manual resume (branch path-efficiency-hybrid). See CLAUDE.md
+  # "Crash-Safe Manual Resume Workflow". Rerunning the same --logdir resumes;
+  # these knobs control how forgiving/frequent that resume is.
+  resume_policy: 'auto'      # 'auto' (try latest.pt, fall back to latest_prev.pt, else abort clearly)
+                              # | 'strict' (latest.pt only, no fallback, abort if it fails)
+                              # | 'fresh' (ignore any checkpoint; requires --confirm_fresh if logdir has data)
+  confirm_fresh: False       # required alongside --resume_policy fresh when logdir already has a checkpoint/episodes
+  checkpoint_every: 10000    # save latest.pt every N steps during training, via a callback hook
+                              # inside tools.simulate() (does NOT add a new call/reset boundary — see
+                              # CLAUDE.md). 0 = off (checkpoint only at the existing eval_every boundary).
+
   # Reward shaping (opt-in; default mode = original sparse reward, unchanged)
   reward_mode: 'default'            # 'default' | 'shaped' | 'pbrs'
   reward_progress_scale: 1.0

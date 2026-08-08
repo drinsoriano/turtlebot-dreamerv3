@@ -135,7 +135,123 @@ class Dreamer(nn.Module):
 
 
 def count_steps(folder):
-    return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
+    """Sum validated step counts across saved episodes in `folder`. Opens each
+    .npz and checks for a 'reward' key (tools.validate_episode_file) rather than
+    trusting the filename-encoded length blindly, so a corrupt/truncated file is
+    excluded instead of silently inflating the count. Returns (total_steps, n_skipped).
+    """
+    folder = pathlib.Path(folder)
+    total = 0
+    skipped = []
+    for n in sorted(folder.glob("*.npz")):
+        ok, length, err = tools.validate_episode_file(n)
+        if ok:
+            total += length - 1
+        else:
+            skipped.append((n.name, err))
+    if skipped:
+        names = ", ".join(name for name, _ in skipped[:5])
+        more = f", … (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        print(f"[count_steps] Warning: skipped {len(skipped)} corrupt/invalid .npz "
+              f"file(s) in {folder} (excluded from step count): {names}{more}")
+    return total, len(skipped)
+
+
+def _resolve_checkpoint(logdir, traindir, resume_policy, confirm_fresh):
+    """Resolve which checkpoint (if any) to load at startup, per --resume_policy.
+    Never lets a corrupt/missing checkpoint crash with a raw traceback — prints a
+    clear message and sys.exit()s for any case that should abort instead of
+    silently guessing. Returns (checkpoint_dict_or_None, loaded_path_or_None).
+    """
+    if resume_policy not in ("auto", "strict", "fresh"):
+        sys.exit(f"[resume] Invalid --resume_policy {resume_policy!r} — must be "
+                 f"one of 'auto', 'strict', 'fresh'.")
+
+    latest = logdir / "latest.pt"
+    backup = logdir / "latest_prev.pt"
+    tmp = logdir / "latest.pt.tmp"
+    if tmp.exists():
+        print(f"[resume] Note: found leftover {tmp.name} — a previous checkpoint "
+              f"save was interrupted mid-write. It is not auto-loaded (only "
+              f"{latest.name} / {backup.name} are trusted); safe to ignore or delete.")
+
+    def _try(path):
+        if not path.exists():
+            return None
+        try:
+            ckpt = torch.load(path)
+            if "agent_state_dict" not in ckpt or "optims_state_dict" not in ckpt:
+                raise ValueError("checkpoint missing expected keys")
+            return ckpt
+        except Exception as e:
+            print(f"[resume] Could not load {path}: {e}")
+            return None
+
+    traindir_path = pathlib.Path(traindir)
+    non_empty = latest.exists() or backup.exists() or any(traindir_path.glob("*.npz"))
+
+    if resume_policy == "fresh":
+        if non_empty and not confirm_fresh:
+            sys.exit(
+                f"[resume] --resume_policy fresh was given but {logdir} already contains "
+                f"a checkpoint and/or replay episodes. Refusing to silently start fresh — "
+                f"that would discard existing progress and confuse experiment interpretation. "
+                f"Re-run with --confirm_fresh to proceed anyway, or use a new --logdir, or "
+                f"drop --resume_policy fresh to resume normally."
+            )
+        if non_empty:
+            n_leftover = len(list(traindir_path.glob("*.npz")))
+            print(f"[resume] --resume_policy fresh --confirm_fresh: starting the AGENT "
+                  f"fresh (no checkpoint loaded), but {n_leftover} pre-existing episode "
+                  f"file(s) remain in {traindir} and will still be counted/replayed. "
+                  f"Use a new --logdir for a fully clean run.")
+        return None, None
+
+    ckpt = _try(latest)
+    if ckpt is not None:
+        return ckpt, latest
+
+    if resume_policy == "strict":
+        if latest.exists():
+            sys.exit(
+                f"[resume] --resume_policy strict: {latest} exists but failed to load "
+                f"(see error above), and strict mode does not fall back to a backup. "
+                f"Re-run with --resume_policy auto to allow falling back to {backup.name}, "
+                f"or --resume_policy fresh --confirm_fresh to discard this run's checkpoint."
+            )
+        return None, None  # no latest.pt at all -> genuinely fresh, nothing to be strict about
+
+    # auto (default)
+    ckpt = _try(backup)
+    if ckpt is not None:
+        print(f"[resume] Recovered using backup checkpoint {backup} "
+              f"(primary {latest.name} was missing or failed to load).")
+        return ckpt, backup
+
+    if latest.exists() or backup.exists():
+        sys.exit(
+            f"[resume] --resume_policy auto: both {latest.name} and {backup.name} in "
+            f"{logdir} are missing or failed to load (see errors above). Aborting instead "
+            f"of silently starting fresh in a non-empty logdir. Re-run with "
+            f"--resume_policy fresh --confirm_fresh if you intend to discard this run's "
+            f"checkpoint."
+        )
+    return None, None  # neither file exists -> genuinely fresh logdir
+
+
+def _make_checkpoint_fn(agent, logdir):
+    """Returns a zero-arg closure that atomically saves latest.pt (with backup
+    rotation), reading the live agent/optimizer state at call time. Passed to
+    tools.simulate() as checkpoint_fn — see its docstring for the non-invasive
+    hook contract (no env/RSSM/episode side effects, purely an extra save)."""
+    def _fn():
+        items_to_save = {
+            "agent_state_dict": agent.state_dict(),
+            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+        }
+        tools.atomic_torch_save(items_to_save, logdir / "latest.pt", keep_backup=True)
+        print(f"[checkpoint] saved latest.pt at step {agent._step}")
+    return _fn
 
 
 def make_dataset(episodes, config):
@@ -217,7 +333,7 @@ def main(config):
     logdir.mkdir(parents=True, exist_ok=True)
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
-    step = count_steps(config.traindir)
+    step, n_skipped_initial = count_steps(config.traindir)
     # step in logger is environmental step
     logger = tools.Logger(logdir, config.action_repeat * step, log_videos=config.log_videos, csv_dir=config.csv_dir)
 
@@ -247,7 +363,7 @@ def main(config):
 
     state = None
     if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
+        prefill = max(0, config.prefill - step)
         print(f"Prefill dataset ({prefill} steps).")
         if hasattr(acts, "discrete"):
             random_actor = tools.OneHotDist(
@@ -290,12 +406,41 @@ def main(config):
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
-    if (logdir / "latest.pt").exists():
-        print('loading model')
-        checkpoint = torch.load(logdir / "latest.pt")
+    checkpoint, loaded_ckpt_path = _resolve_checkpoint(
+        logdir, config.traindir, config.resume_policy, config.confirm_fresh)
+    if checkpoint is not None:
+        print(f"[resume] Loaded checkpoint: {loaded_ckpt_path}")
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
+    else:
+        print("[resume] Starting fresh — no checkpoint loaded.")
+
+    # Resume event log — one row per process start, so a crash/resume history is
+    # visible without cross-referencing timestamps across the other CSVs. Lives in
+    # logdir/ (gitignored), not csv_dir, since it's a per-run breadcrumb, not a metric.
+    try:
+        import csv as _csv
+        import datetime as _dt
+        _re_path = logdir / "resume_events.csv"
+        _re_is_new = not _re_path.exists()
+        with open(_re_path, "a", newline="") as _re_f:
+            _re_w = _csv.writer(_re_f)
+            if _re_is_new:
+                _re_w.writerow(["datetime", "resume_policy", "checkpoint_loaded", "step",
+                                "replay_episodes_loaded", "corrupt_episodes_skipped"])
+            _re_w.writerow([
+                _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                config.resume_policy,
+                str(loaded_ckpt_path) if loaded_ckpt_path else "none (fresh start)",
+                step,
+                len(train_eps),
+                n_skipped_initial,
+            ])
+    except Exception as e:
+        print(f"[resume] Warning: could not write resume_events.csv: {e}")
+    print(f"[resume] step={step}  replay_episodes={len(train_eps)}  "
+          f"corrupt_skipped={n_skipped_initial}  resume_policy={config.resume_policy}")
 
     # Loop bound is steps + eval_every so the model AT config.steps gets evaluated
     # (eval runs at the top of each iteration); the break below then stops before
@@ -324,7 +469,7 @@ def main(config):
                             "agent_state_dict": agent.state_dict(),
                             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
                 }
-                torch.save(items_to_save, logdir / "best.pt")
+                tools.atomic_torch_save(items_to_save, logdir / "best.pt", keep_backup=False)
                 data = pd.DataFrame({'scores': eval_ret})
                 data.to_csv(f'./{logdir}/best.csv')
 
@@ -332,6 +477,7 @@ def main(config):
             break
 
         print("Start training.")
+        _checkpoint_fn = _make_checkpoint_fn(agent, logdir) if config.checkpoint_every > 0 else None
         state = tools.simulate(
             agent,
             train_envs,
@@ -341,13 +487,16 @@ def main(config):
             limit=config.dataset_size,
             steps=config.eval_every,
             state=state,
+            checkpoint_every=config.checkpoint_every,
+            checkpoint_fn=_checkpoint_fn,
         )
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         }
-        torch.save(items_to_save, logdir / "latest.pt")
-        
+        tools.atomic_torch_save(items_to_save, logdir / "latest.pt", keep_backup=True)
+        print(f"[checkpoint] saved latest.pt at step {agent._step}")
+
     for env in train_envs + eval_envs:
         try:
             env.close()
