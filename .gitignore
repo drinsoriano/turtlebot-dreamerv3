@@ -161,3 +161,39 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 a.bash
+
+# ---------------------------------------------------------------------------
+# Project-specific: raw training artifacts, local tooling, unpublished research
+# ---------------------------------------------------------------------------
+
+# Raw training artifacts (also covered under dreamerv3-torch/.gitignore for
+# that subtree; repeated at repo root as a safety net for any other location)
+logdir/
+log/
+**/train_eps/
+**/eval_eps/
+*.npz
+*.pt
+*.pth
+*.ckpt
+latest.pt.tmp
+latest_prev.pt
+
+# Experiment / tuning databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local unpublished research manuscript, analysis outputs, and audits —
+# not yet published; must not be pushed (see project confidentiality policy)
+research_manuscript/
+SAMPLE_GAZEBO/
+
+# Local editor/agent tooling and ROS2 colcon build/log artifacts
+.claude/
+install/
+
+# Misc local temp/backup files
+*.tmp
+*.bak

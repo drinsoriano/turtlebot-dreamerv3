@@ -163,6 +163,21 @@ def load_pl(run_name: str) -> pd.DataFrame:
     return _safe_read_csv(p)
 
 
+@st.cache_data(ttl=CACHE_TTL)
+def load_resume_events(logdir_str: str) -> pd.DataFrame:
+    """Tiny, path-keyed loader for {logdir}/resume_events.csv (written by
+    dreamer.py on every process start — see CLAUDE.md "Crash-Safe Manual Resume
+    Workflow"). Unlike the other load_* functions this does NOT read from the
+    global CSV_DIR — resume_events.csv lives inside the training --logdir, a
+    different filesystem location. The file is at most a handful of rows (one per
+    process start), so no row cap is needed and this stays fast.
+    """
+    p = Path(logdir_str).expanduser() / "resume_events.csv"
+    if not p.exists():
+        return pd.DataFrame()
+    return _safe_read_csv(p)
+
+
 # ─── Cross-folder loaders (used by the Compare / Convergence tabs) ────────────
 # The per-run tabs read from the single sidebar-selected CSV_DIR. The Compare and
 # Convergence tabs instead overlay runs from *different* auto-organized folders
@@ -287,10 +302,72 @@ def _clr(i: int) -> str:
     return PALETTE[i % len(PALETTE)]
 
 
-def _success_mask(df: pd.DataFrame):
-    if df.empty or "steps_to_goal" not in df.columns:
+# ─── Outcome metrics vs path metrics ──────────────────────────────────────────
+# Path/trajectory metrics stay numerically defined on FAILED episodes — a robot
+# that collides 1 m from the start still produces a path-efficiency number, and a
+# short doomed path can score *higher* than a real solved detour. Summarising them
+# over all outcomes is therefore misleading, so every reported path-metric mean /
+# rolling line is success-only by default.
+# Outcome + safety metrics (success/collision/timeout rates, obstacle distance,
+# near-collisions) must instead use EVERY episode — filtering them to successes
+# would make them meaningless (a success-only "success rate" is always 100%).
+# See CLAUDE.md "Metrics for Final Analysis".
+_PATH_METRIC_COLS = {
+    "planner_path_efficiency_hybrid",
+    "planner_path_efficiency",
+    "planner_path_efficiency_center",
+    "path_directness",
+    "local_efficiency",
+    "actual_path_length",
+    "episode_steps",
+    "steps_to_goal",
+}
+
+
+def _is_path_metric(col: str) -> bool:
+    return col in _PATH_METRIC_COLS
+
+
+# Each planner variant carries its own status column; using the plain
+# `planner_status` for the hybrid/centre metric would validate the wrong planner.
+_PLANNER_STATUS_COL = {
+    "planner_path_efficiency_hybrid": "planner_status_hybrid",
+    "planner_path_efficiency_center": "planner_status_center",
+    "planner_path_efficiency":        "planner_status",
+}
+
+
+def _planner_valid_mask(df: pd.DataFrame, col: str, success_only: bool = True):
+    """Rows usable for a planning-CSV metric: the matching planner status is `ok`
+    AND (for path metrics, when success_only) the episode actually succeeded.
+    Status alone is not enough — a collision episode can still have a perfectly
+    valid plan and a flatteringly high efficiency number."""
+    if df is None or df.empty:
         return None
-    return df["steps_to_goal"] != -1
+    status_col = _PLANNER_STATUS_COL.get(col, "planner_status")
+    if status_col not in df.columns and "planner_status" in df.columns:
+        status_col = "planner_status"
+    ok = (df[status_col] == "ok") if status_col in df.columns \
+        else pd.Series([True] * len(df), index=df.index)
+    if success_only and _is_path_metric(col):
+        sm = _success_mask(df)
+        if sm is not None:
+            ok = ok & sm
+    return ok
+
+
+def _success_mask(df: pd.DataFrame):
+    """Boolean success mask. Prefers the explicit `outcome` label — it exists in
+    BOTH blackbox and planning frames (so this works for planner metrics too) and
+    is correct under any reward mode. Falls back to the blackbox-only
+    steps_to_goal == -1 sentinel for pre-outcome CSVs."""
+    if df is None or df.empty:
+        return None
+    if "outcome" in df.columns:
+        return df["outcome"].astype(str) == "success"
+    if "steps_to_goal" in df.columns:
+        return df["steps_to_goal"] != -1
+    return None
 
 
 # ─── Perf helpers: row-capped tables + chart-trace downsampling ───────────────
@@ -663,11 +740,15 @@ def _section_bb(selected: list, bb_data: dict, show_cumulative: bool, show_r100:
         ("collision_rate",    "Collision Rate (%)",
          [("rolling_collision_rate_100", "dash", "rolling-100"),
           ("rolling_collision_rate_500", "dot",  "rolling-500")], False),
-        ("steps_to_goal",     "Steps to Goal  (successful episodes only)", None, True),
-        ("episode_steps",     "Episode Steps  (all outcomes)",             None, False),
-        ("path_directness",   "Path Directness  [0 – 1]",                  None, False),
-        ("min_obstacle_dist", "Min Obstacle Distance (m)",                  None, False),
-        ("near_collisions",   "Near Collisions",                            None, False),
+        # Path/trajectory metrics -> success-only (see _PATH_METRIC_COLS: a failed
+        # episode still yields a number, and a short doomed path can look "good").
+        ("steps_to_goal",     "Steps to Goal — success-only",              None, True),
+        ("episode_steps",     "Episode Steps — success-only",              None, True),
+        ("path_directness",   "Path Directness  [0 – 1] — success-only",   None, True),
+        ("local_efficiency",  "Local Efficiency  [−1 – 1] — success-only", None, True),
+        # Safety/outcome metrics -> every episode (filtering them would distort them).
+        ("min_obstacle_dist", "Min Obstacle Distance (m)  (all episodes)",  None, False),
+        ("near_collisions",   "Near Collisions  (all episodes)",            None, False),
     ]
     for col, title, extra, success_only in specs:
         fig = _bb_chart(run_map, col, title, extra, success_only,
@@ -933,6 +1014,41 @@ _GOAL_METRICS_UNIT = {"planner_path_efficiency_hybrid", "planner_path_efficiency
                       "_success01", "path_directness"}
 
 
+def _section_goal_outcome_trend(run_name: str, bb_df: pd.DataFrame, goal: str,
+                                roll_window: int) -> None:
+    """Rolling success / collision / timeout rate for one goal. Deliberately uses
+    EVERY episode (no success filter) — this is the outcome half of the split
+    described in _PATH_METRIC_COLS, and filtering it would be meaningless."""
+    if bb_df is None or bb_df.empty or "outcome" not in bb_df.columns \
+            or "goal_id" not in bb_df.columns or "episode" not in bb_df.columns:
+        return
+    g = bb_df[bb_df["goal_id"].astype(str) == str(goal)].copy()
+    if g.empty:
+        return
+    g = g.sort_values("episode")
+    st.markdown("**Outcome trend for this goal** — all episodes (no success filter)")
+    fig = go.Figure()
+    for oc, oc_color in OUTCOME_TEXT_COLORS.items():
+        ind = (g["outcome"].astype(str) == oc).astype(float)
+        if ind.sum() == 0:
+            continue
+        fig.add_trace(go.Scatter(
+            x=g["episode"], y=ind.rolling(roll_window, min_periods=1).mean() * 100,
+            mode="lines", name=f"{oc} rate", line=dict(width=2, color=oc_color),
+        ))
+    fig.update_layout(
+        xaxis_title="Episode", yaxis_title=f"Rolling-{roll_window} rate (%)",
+        yaxis=dict(range=[0, 105]), height=300,
+        margin=dict(l=50, r=20, t=30, b=40), legend=dict(font_size=10),
+    )
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"plan_goaloutcome_{run_name}")
+    st.caption(
+        f"Computed over all {len(g)} appearances of this goal — success, collision "
+        "and timeout rates always include every episode."
+    )
+
+
 def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame,
                            roll_window: int) -> None:
     """🔍 Per-goal learning — pick one goal_id and watch a chosen metric over its
@@ -956,14 +1072,36 @@ def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFra
         "outcome, so a red point after green points = it collided again though it "
         "had succeeded on this goal before."
     )
+    st.info(
+        "**Outcome metrics are computed over all episodes. Path-efficiency metrics "
+        "are summarized over successful episodes only**, because path quality is "
+        "meaningful for final comparison only when the robot reaches the goal."
+    )
 
-    counts = gids.value_counts()
+    # Appearance counts come from ONE frame (blackbox preferred — it has outcome +
+    # goal_id for every episode). Concatenating pl_df and bb_df here would count the
+    # same episode twice whenever both carry goal_id, which is the normal case now.
+    _count_src = bb_df if (bb_df is not None and not bb_df.empty
+                           and "goal_id" in bb_df.columns) else pl_df
+    _cs = _count_src["goal_id"].astype(str) if (
+        _count_src is not None and not _count_src.empty
+        and "goal_id" in _count_src.columns) else pd.Series(dtype=str)
+    _cs = _cs[_cs.str.strip().ne("") & _cs.ne("nan") & _cs.ne("None")]
+    counts = _cs.value_counts() if not _cs.empty else gids.value_counts()
+    _sm_count = _success_mask(_count_src)
+    succ_counts = (_count_src.loc[_sm_count, "goal_id"].astype(str).value_counts()
+                   if _sm_count is not None else pd.Series(dtype=int))
+
+    def _goal_label(gid: str) -> str:
+        tot = int(counts.get(gid, 0))
+        suc = int(succ_counts.get(gid, 0))
+        return f"{gid}  (total n={tot}, success n={suc})"
+
     c1, c2 = st.columns([3, 3])
     with c1:
         goal = st.selectbox(
             "Goal (by appearance count)", list(counts.index),
-            format_func=lambda g: f"{g}  (n={int(counts[g])})",
-            key=f"plan_goalsel_{run_name}",
+            format_func=_goal_label, key=f"plan_goalsel_{run_name}",
         )
     with c2:
         avail = [lbl for lbl, (src, col) in _GOAL_METRICS.items()
@@ -972,6 +1110,36 @@ def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFra
         metric_label = st.selectbox("Metric", avail, key=f"plan_goalmetric_{run_name}")
 
     src, col = _GOAL_METRICS[metric_label]
+    is_path = _is_path_metric(col)
+
+    # ── Path-metric filter (success-only by default) ──────────────────────────
+    path_mode = "Success-only (recommended for thesis)"
+    show_failed = False
+    if is_path:
+        f1, f2 = st.columns([3, 2])
+        with f1:
+            path_mode = st.radio(
+                "Path metric filter",
+                ["Success-only (recommended for thesis)",
+                 "All episodes (diagnostic only)"],
+                index=0, horizontal=False, key=f"plan_goalfilter_{run_name}",
+            )
+        with f2:
+            show_failed = st.checkbox(
+                "Show failed episodes as diagnostic markers", value=True,
+                key=f"plan_goalshowfail_{run_name}",
+                help="Collision/timeout points stay visible for diagnosis but are "
+                     "excluded from rolling lines and summary cards in success-only mode.",
+            )
+    success_only = is_path and path_mode.startswith("Success-only")
+    if is_path and not success_only:
+        st.warning(
+            "**Diagnostic mode:** failed episodes may show high path-efficiency "
+            "values because the metric is mathematically computed from travelled "
+            "path length even when the robot did not reach the goal. Do not use "
+            "this mode for final thesis path-efficiency claims."
+        )
+
     base = pl_df if src == "planning" else bb_df
     if base is None or base.empty or "goal_id" not in base.columns \
             or "episode" not in base.columns:
@@ -990,32 +1158,63 @@ def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFra
     g = g.sort_values("episode")
     yv = pd.to_numeric(g[col], errors="coerce")
 
+    # Split the frame: `g_stat` drives every rolling line / mean / summary card,
+    # `g` still drives the outcome-coloured markers so failures stay *visible*
+    # without ever entering a path-metric aggregate.
+    sm_g = _success_mask(g)
+    if success_only and sm_g is not None:
+        g_stat, y_stat = g[sm_g], yv[sm_g]
+    else:
+        g_stat, y_stat = g, yv
+    if g_stat.empty:
+        st.caption(f"*No successful episodes yet for goal {goal} — "
+                   f"nothing to summarise in success-only mode.*")
+        return
+
+    chart_label = f"{metric_label} — success-only" if success_only else metric_label
+
     # ── Outcome-coloured scatter + rolling trend ──────────────────────────────
     fig = go.Figure()
     if "outcome" in g.columns:
         for oc, oc_color in OUTCOME_TEXT_COLORS.items():
+            # In success-only mode failed markers are optional diagnostics; they are
+            # never part of y_stat, so they cannot move the rolling line or the cards.
+            if oc != "success" and success_only and not show_failed:
+                continue
             m = g["outcome"] == oc
             if m.any():
+                is_diag = success_only and oc != "success"
                 fig.add_trace(go.Scatter(
-                    x=g.loc[m, "episode"], y=yv[m], mode="markers", name=oc,
-                    marker=dict(size=6, color=oc_color),
+                    x=g.loc[m, "episode"], y=yv[m], mode="markers",
+                    name=f"{oc} (diagnostic, excluded)" if is_diag else oc,
+                    marker=dict(size=6, color=oc_color,
+                                symbol="x" if is_diag else "circle",
+                                opacity=0.55 if is_diag else 1.0),
                 ))
     else:
         fig.add_trace(go.Scatter(x=g["episode"], y=yv, mode="markers",
                                  name=metric_label, marker=dict(size=6)))
     fig.add_trace(go.Scatter(
-        x=g["episode"], y=yv.rolling(roll_window, min_periods=1).mean(),
-        mode="lines", name=f"Rolling {roll_window}",
+        x=g_stat["episode"], y=y_stat.rolling(roll_window, min_periods=1).mean(),
+        mode="lines",
+        name=f"Rolling {roll_window}" + (" (success-only)" if success_only else ""),
         line=dict(width=2, color="#1f77b4", dash="dash"),
     ))
     ylo_hi = dict(range=[0, 1.05]) if col in _GOAL_METRICS_UNIT else {}
     fig.update_layout(
-        xaxis_title="Episode", yaxis_title=metric_label, yaxis=ylo_hi,
+        xaxis_title="Episode", yaxis_title=chart_label, yaxis=ylo_hi,
         height=360, margin=dict(l=50, r=20, t=30, b=40), legend=dict(font_size=10),
     )
     st.plotly_chart(fig, use_container_width=True, key=f"plan_goalcurve_{run_name}")
+    if success_only:
+        st.caption(
+            "Collision and timeout episodes are shown for diagnosis only and are "
+            "excluded from success-only path metric summaries."
+        )
 
     # ── Improvement summary: first third vs last third (by episode order) ──────
+    # Outcome rates use ALL appearances of the goal (`g`); the path-metric mean uses
+    # the filtered frame (`g_stat`) so failures never inflate it.
     n = len(g)
     if n >= 6:
         k = max(1, n // 3)
@@ -1024,22 +1223,34 @@ def _section_goal_learning(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFra
         def _rate(df, oc):
             return round((df["outcome"] == oc).mean() * 100, 1) if "outcome" in df else None
 
+        def _delta(a, b):
+            return f"{b - a:+.1f}" if (a is not None and b is not None) else None
+
+        ns = len(g_stat)
+        ks = max(1, ns // 3)
+        first_s, last_s = g_stat.iloc[:ks], g_stat.iloc[-ks:]
+
         def _avg(df):
             s = pd.to_numeric(df[col], errors="coerce").dropna()
             return float(s.mean()) if not s.empty else None
 
-        def _delta(a, b):
-            return f"{b - a:+.1f}" if (a is not None and b is not None) else None
-
-        st.caption(f"**Improvement** — first {k} vs last {k} appearances of this goal")
+        st.caption(
+            f"**Improvement** — outcome rates over first {k} vs last {k} appearances; "
+            f"{metric_label} mean over first {ks} vs last {ks} "
+            f"{'successful ' if success_only else ''}appearances"
+        )
         m1, m2, m3 = st.columns(3)
         sf, sl = _rate(first, "success"), _rate(last, "success")
         cf, cl = _rate(first, "collision"), _rate(last, "collision")
-        af, al = _avg(first), _avg(last)
+        af, al = _avg(first_s), _avg(last_s)
         m1.metric("Success rate", _fmt(sl, 1, "%"), _delta(sf, sl))
         m2.metric("Collision rate", _fmt(cl, 1, "%"),
                   _delta(cf, cl), delta_color="inverse")
-        m3.metric(f"{metric_label} (mean)", _fmt(al, 3), _delta(af, al))
+        m3.metric(f"{metric_label} mean" + (", success-only" if success_only else ""),
+                  _fmt(al, 3), _delta(af, al))
+
+    # ── Outcome trend for this goal (ALL episodes, always) ────────────────────
+    _section_goal_outcome_trend(run_name, bb_df, goal, roll_window)
 
     # ── Filtered episode table (planning + blackbox merged on episode) ────────
     cols_pl = [c for c in ["episode", "datetime", "outcome",
@@ -1140,9 +1351,19 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
     # be made on successful episodes only (failed episodes mix in truncated paths).
     success_only = st.checkbox(
         "Success-only (recommended for reported results)",
-        value=False, key=f"plan_suconly_{run_name}",
+        value=True, key=f"plan_suconly_{run_name}",
+        help="On by default: path efficiency is only meaningful when the robot "
+             "actually reached the goal. Unticking shows failed episodes too — "
+             "diagnostic only, not for reported path-efficiency claims.",
     ) if "outcome" in pl_df.columns else False
     chart_df = pl_df[pl_df["outcome"] == "success"] if success_only else pl_df
+    if "outcome" in pl_df.columns and not success_only:
+        st.warning(
+            "**Diagnostic mode:** failed episodes may show high path-efficiency "
+            "values because the metric is computed from travelled path length even "
+            "when the robot did not reach the goal. Do not use this mode for final "
+            "thesis path-efficiency claims."
+        )
 
     # Per-goal grouping (fixed-goal experiments): one rolling-mean series per goal_id,
     # so you see whether each goal's path tightens over training. Degrades silently
@@ -1252,6 +1473,11 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
 
     selected_ep = None
     outcome_val = ""
+    sel_row_goal = ""
+    # Set by _section_goal_learning's selectbox just above; absent when the run has
+    # no goal_id data (that function returns early before creating the widget).
+    sel_goal = st.session_state.get(f"plan_goalsel_{run_name}")
+    has_goal_col = "goal_id" in pl_df.columns
 
     exclude_bad_planner = st.checkbox(
         "Exclude non-ok planner rows (no_path / planner_error / …)",
@@ -1259,7 +1485,28 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
         help="Off by default. planner_status != 'ok' rows have blank efficiency "
              "by design (see CLAUDE.md) — this just hides them from the table.",
     ) if "planner_status" in pl_df.columns else False
+
+    # Keeps the clicked row — and therefore the path plot below — on the same goal
+    # the per-goal chart above is filtering, so the two can't visually disagree.
+    filter_to_goal = st.checkbox(
+        f"Filter planning log to selected per-goal goal_id  (`{sel_goal}`)",
+        value=True, key=f"plan_filter_to_goal_{run_name}",
+        help="On by default so the row you click — and therefore the path plot "
+             "below — always belongs to the goal selected in the per-goal chart "
+             "above. Turn off to browse every goal.",
+    ) if (sel_goal and has_goal_col) else False
+
     log_df = pl_df[pl_df["planner_status"] == "ok"] if exclude_bad_planner else pl_df
+    if filter_to_goal:
+        log_df = log_df[log_df["goal_id"].astype(str) == str(sel_goal)]
+        if log_df.empty:
+            st.caption(f"*No planning rows for goal {sel_goal} under the current filters.*")
+
+    # Goal-scoped widget key: changing the per-goal dropdown creates a NEW widget
+    # with an empty selection instead of carrying a stale row index onto a
+    # different goal's rows. This is why the goal mismatch is fixed by filtering
+    # rather than by hand-clearing the selection (Streamlit has no API for that).
+    _sel_tag = f"_{sel_goal}" if filter_to_goal else ""
 
     # Row cap applied BEFORE display — the click handler below must resolve
     # row_idx against this SAME frame (table_df), since Streamlit's on_select
@@ -1278,7 +1525,7 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             styled = base
         event = st.dataframe(
             styled, width="stretch",
-            key=f"plan_table_render_{run_name}",
+            key=f"plan_table_render_{run_name}{_sel_tag}",
             on_select="rerun", selection_mode="single-row",
         )
     except Exception:
@@ -1287,7 +1534,7 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
             display_pl[col] = display_pl[col].astype(str)
         event = st.dataframe(
             display_pl, width="stretch",
-            key=f"plan_table_fb_{run_name}",
+            key=f"plan_table_fb_{run_name}{_sel_tag}",
             on_select="rerun", selection_mode="single-row",
         )
 
@@ -1302,9 +1549,15 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
                 selected_ep = int(clicked["episode"])
             if "outcome" in clicked.index:
                 outcome_val = str(clicked["outcome"])
+            if "goal_id" in clicked.index:
+                sel_row_goal = str(clicked["goal_id"])
 
     # ── Episode Path Plot (driven by table row click) ─────────────────────────
     st.subheader("Episode Path Plot")
+    st.caption(
+        "The path plot is generated from the selected Planning Log row, not "
+        "directly from the per-goal dropdown."
+    )
 
     if "episode" not in pl_df.columns:
         st.info("No episodes in planning CSV.")
@@ -1314,6 +1567,22 @@ def _section_planner(run_name: str, pl_df: pd.DataFrame, bb_df: pd.DataFrame):
         st.info("Click a row in the Planning Log table above to view its path plot.")
     else:
         ep_row = pl_df[pl_df["episode"] == selected_ep]
+
+        # Provenance of the image below: which row it came from, and what the
+        # per-goal chart above is currently filtering.
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Episode", str(selected_ep))
+        i2.metric("Outcome", outcome_val or "—")
+        i3.metric("Row goal_id", sel_row_goal or "—")
+        i4.metric("Per-goal filter", str(sel_goal) if sel_goal else "—")
+        # Unreachable while the goal filter is ON (it is filtered out by
+        # construction); this is the labelling path for the filter-OFF case.
+        if sel_goal and sel_row_goal and str(sel_row_goal) != str(sel_goal):
+            st.warning(
+                f"The selected path plot belongs to goal_id {sel_row_goal}, while "
+                f"the Per-goal chart above is filtering goal_id {sel_goal}."
+            )
+
         _plot_dir = (run_name[len("eval_"):] + "_eval"
                      if run_name.startswith("eval_")
                      else run_name)
@@ -1643,9 +1912,8 @@ def _section_bo_trials(df: pd.DataFrame):
             else:
                 color, width, opacity = "#d62728", 1.0, 0.55
 
-            ok_mask = (pl_df["planner_status"] == "ok") \
-                if "planner_status" in pl_df.columns \
-                else pd.Series([True] * len(pl_df), index=pl_df.index)
+            # ok status AND success-only (path metric) — see _planner_valid_mask.
+            ok_mask = _planner_valid_mask(pl_df, "planner_path_efficiency")
             eff = pl_df["planner_path_efficiency"].where(ok_mask)
             rolled = eff.rolling(roll_bo, min_periods=1).mean()
 
@@ -1741,7 +2009,9 @@ def _section_bo_trials(df: pd.DataFrame):
         bb_roll = st.slider("Rolling window", 1, 100, 20, key="bo_bb_roll")
 
     bb_col = BB_METRIC_OPTIONS[bb_metric_label]
-    success_only_bb = bb_col == "steps_to_goal"
+    # Every path/trajectory metric is success-only, not just steps_to_goal — a
+    # failed episode still produces a path_directness / efficiency number.
+    success_only_bb = _is_path_metric(bb_col)
 
     # Load blackbox CSVs for the same FILTERED trial set (df_load, from the
     # "Trial data to load" filter above) — not every trial in the study.
@@ -1865,7 +2135,8 @@ def _section_compare():
 
     src, col = _CMP_METRICS[metric_label]
     phases = {"Train": ["train"], "Eval": ["eval"], "Both": ["train", "eval"]}[phase]
-    success_only = col == "steps_to_goal"
+    # All path/trajectory metrics are success-only (not just steps_to_goal).
+    success_only = _is_path_metric(col)
 
     # ── Build chart ───────────────────────────────────────────────────────────
     fig = go.Figure()
@@ -1884,9 +2155,7 @@ def _section_compare():
                 if df.empty or col not in df.columns:
                     skipped.append(label)
                     continue
-                ok_mask = (df["planner_status"] == "ok") \
-                    if "planner_status" in df.columns \
-                    else pd.Series([True] * len(df), index=df.index)
+                ok_mask = _planner_valid_mask(df, col, success_only)
                 series = pd.to_numeric(df[col], errors="coerce").where(ok_mask)
                 x = df["episode"] if "episode" in df.columns else pd.RangeIndex(len(df))
             else:
@@ -1983,6 +2252,9 @@ def _section_convergence():
     fig = go.Figure()
     table_rows: list[dict] = []
     skipped: list[str] = []
+    # Path/trajectory metrics converge on SUCCESSFUL episodes only — including
+    # failures would let a short doomed path flatter the curve.
+    success_only = _is_path_metric(col)
 
     for i, run in enumerate(sel_runs):
         color = _clr(i)
@@ -1992,9 +2264,7 @@ def _section_convergence():
             if df.empty or col not in df.columns:
                 skipped.append(run)
                 continue
-            ok_mask = (df["planner_status"] == "ok") \
-                if "planner_status" in df.columns \
-                else pd.Series([True] * len(df), index=df.index)
+            ok_mask = _planner_valid_mask(df, col, success_only)
             series = pd.to_numeric(df[col], errors="coerce").where(ok_mask)
             x = df["episode"] if "episode" in df.columns else pd.RangeIndex(len(df))
         else:
@@ -2002,6 +2272,12 @@ def _section_convergence():
             if df.empty or col not in df.columns:
                 skipped.append(run)
                 continue
+            if success_only:
+                sm = _success_mask(df)
+                df = df[sm] if sm is not None else df
+                if df.empty:
+                    skipped.append(run)
+                    continue
             series = pd.to_numeric(df[col], errors="coerce")
             x = df["_idx"] if "_idx" in df.columns else pd.RangeIndex(len(df))
 
@@ -2495,6 +2771,179 @@ python3 export_tune_results.py --stage 1 --odometry-mode full_imu
     )
 
 
+# Trial034 validation-protocol weights, exactly as documented in CLAUDE.md
+# "Validation Protocol" / Example Commands. 'default' emits no extra --reward_*
+# flags (--reward_mode default, original sparse reward, byte-for-byte unchanged).
+_REWARD_PRESETS = {
+    "default": {},
+    "trial034_eff_tuned": {
+        "reward_progress_scale": "1.73768",
+        "reward_step_penalty": "0.037479",
+        "reward_turn_penalty": "0.0160898",
+        "reward_near_obstacle_scale": "0.000422429",
+        "reward_near_obstacle_sigma": "0.454763",
+        "actor_entropy": "0.000102611",
+    },
+}
+
+
+def _section_training_commands():
+    """Display-only command builder — never executes anything. Every action
+    (start/resume training, scan corrupt episodes, repair CSV NULs, delete a
+    logdir) stays a copy-ready st.code() block for the user's own terminal."""
+    st.subheader("🆘 Training Commands / Crash Resume")
+    st.caption(
+        "Copy-ready terminal commands for starting, resuming, and recovering a "
+        "training run. Nothing on this page executes anything — copy a command "
+        "into your own terminal to run it."
+    )
+
+    st.warning(
+        "- To **resume**, rerun the *exact same* training command with the "
+        "*same* `--logdir` below.\n"
+        "- Use a **new** `--logdir` for clean thesis A/B validation runs.\n"
+        "- Do **not** delete a logdir that is currently training.\n"
+        "- Do **not** run `rm -rf` from inside the dashboard — copy the command "
+        "and run it yourself in a terminal.\n"
+        "- Do **not** commit `logdir/`, `csv_logs/`, `path_plots/`, `*.db`, "
+        "`*.npz`, `*.pt`, `*.pth`, `*.tmp`, or `*.bak` files."
+    )
+
+    st.markdown("#### Run configuration")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        logdir_input = st.text_input(
+            "logdir", value="./logdir/stage4_360_full_imu_seed0_eff_tuned_fixedgoal_v2",
+            key="tc_logdir",
+            help="Same value passed to --logdir. Rerunning with this exact path "
+                 "resumes; a different path starts a fresh run.",
+        )
+        stage = st.number_input("stage", min_value=1, max_value=8, value=4, step=1, key="tc_stage")
+        odometry_mode = st.selectbox(
+            "odometry_mode", ["none", "twist", "delta", "full", "full_imu"],
+            index=4, key="tc_odometry_mode",
+        )
+    with col2:
+        seed = st.number_input("seed", min_value=0, value=0, step=1, key="tc_seed")
+        checkpoint_every = st.number_input(
+            "checkpoint_every", min_value=0, value=10000, step=1000, key="tc_checkpoint_every",
+            help="0 disables interval checkpointing (checkpoint only at the "
+                 "eval_every boundary). See CLAUDE.md Crash-Safe Manual Resume Workflow.",
+        )
+        eval_episode_num = st.number_input(
+            "eval_episode_num", min_value=1, value=100, step=10, key="tc_eval_episode_num",
+        )
+    with col3:
+        steps = st.number_input("steps", min_value=1000, value=300000, step=10000, key="tc_steps")
+        reward_preset = st.selectbox(
+            "reward preset", list(_REWARD_PRESETS.keys()), key="tc_reward_preset",
+        )
+        fixed_goals = st.text_input(
+            "fixed_goals", value="2.0,2.0;-2.0,-2.0;2.0,-2.0;-2.0,2.0",
+            key="tc_fixed_goals",
+            help="';'-separated 'x,y' pairs. Leave blank for normal random goals.",
+        )
+
+    csv_dir_input = st.text_input(
+        "csv_dir (for CSV NUL repair below)", value=str(CSV_DIR), key="tc_csv_dir",
+        help="Defaults to the dashboard's active CSV folder (sidebar picker). "
+             "Override if the crashed run used a different --csv_dir.",
+    )
+
+    st.divider()
+
+    # ── A. Start Gazebo ──────────────────────────────────────────────────
+    st.markdown(f"#### A. Start Gazebo — stage {int(stage)}, headless")
+    st.code(
+        "export TURTLEBOT3_MODEL=burger\n"
+        f"ros2 launch ~/turtlebot-dreamerv3/turtlebot3_gazebo/launch/turtle_stage{int(stage)}.py gui:=false",
+        language="bash",
+    )
+
+    # ── B. Start / resume DreamerV3 ──────────────────────────────────────
+    st.markdown("#### B. Start / resume DreamerV3")
+    st.caption(
+        "Rerunning this exact command (same --logdir) resumes automatically — "
+        "check the resume history table at the bottom of this page to confirm."
+    )
+    lines = [
+        "cd ~/turtlebot-dreamerv3/dreamerv3-torch",
+        "python3 dreamer.py --configs turtle --task turtle \\",
+        f"  --logdir {logdir_input} \\",
+        f"  --stage {int(stage)} --lidar 360 --odometry_mode {odometry_mode} --seed {int(seed)} \\",
+        f"  --device cuda --steps {int(steps)} --eval_episode_num {int(eval_episode_num)} \\",
+        f"  --checkpoint_every {int(checkpoint_every)} \\",
+    ]
+    if reward_preset == "default":
+        lines.append("  --reward_mode default \\")
+    else:
+        lines.append("  --reward_mode shaped \\")
+        for flag, val in _REWARD_PRESETS[reward_preset].items():
+            lines.append(f"  --{flag} {val} \\")
+    lines.append(f'  --fixed_goals "{fixed_goals}"')
+    st.code("\n".join(lines), language="bash")
+
+    st.divider()
+
+    # ── C/D. Corrupt episode scan ────────────────────────────────────────
+    st.markdown("#### C. After a crash — scan for corrupt episode files (read-only)")
+    st.code(f"python3 scripts/scan_corrupt_episodes.py --logdir {logdir_input}", language="bash")
+
+    st.markdown("#### D. Optional — clean up the corrupt files found above")
+    st.caption("Only run after reviewing C's output. Prints exactly what it removes before removing anything.")
+    st.code(f"python3 scripts/scan_corrupt_episodes.py --logdir {logdir_input} --clean_corrupt_eps", language="bash")
+
+    st.divider()
+
+    # ── E/F. CSV NUL repair ──────────────────────────────────────────────
+    st.markdown("#### E. CSV NUL-padding repair — dry run (reports only, no changes)")
+    st.code(f"python3 scripts/repair_csv_nuls.py --csv-dir {csv_dir_input}", language="bash")
+
+    st.markdown("#### F. CSV NUL-padding repair — apply (backs up each file to `.bak` first)")
+    st.code(f"python3 scripts/repair_csv_nuls.py --csv-dir {csv_dir_input} --apply", language="bash")
+
+    st.divider()
+
+    # ── G. Safe delete ───────────────────────────────────────────────────
+    st.markdown("#### G. Safely delete an old crashed logdir")
+    st.caption(
+        "Manual, three-step, terminal-only: list before, delete, list after — "
+        "so you can visually confirm what's gone before and after. Never run "
+        "`rm -rf` without checking the listing first."
+    )
+    if not logdir_input.strip():
+        st.info("Enter a logdir above to generate the delete-safety commands.")
+    else:
+        logdir_path = Path(logdir_input)
+        parent_dir = str(logdir_path.parent) if str(logdir_path.parent) not in ("", ".") else "./logdir"
+        run_name = logdir_path.name
+        st.code(
+            f"ls -lh {parent_dir} | grep {run_name}\n"
+            f"rm -rf {logdir_input}\n"
+            f"ls -lh {parent_dir} | grep {run_name}",
+            language="bash",
+        )
+
+    st.divider()
+
+    # ── Resume history ───────────────────────────────────────────────────
+    st.markdown("#### Resume history for this logdir")
+    resume_df = load_resume_events(logdir_input)
+    if resume_df.empty:
+        st.info("No resume_events.csv found yet.")
+    else:
+        st.dataframe(resume_df, width="stretch", key=f"tc_resume_events_{logdir_input}")
+        latest = resume_df.iloc[-1]
+        st.success(
+            f"**Latest resume event:** {latest.get('datetime', '?')} — "
+            f"policy=`{latest.get('resume_policy', '?')}`, "
+            f"checkpoint=`{latest.get('checkpoint_loaded', '?')}`, "
+            f"step={latest.get('step', '?')}, "
+            f"replay_episodes={latest.get('replay_episodes_loaded', '?')}, "
+            f"corrupt_skipped={latest.get('corrupt_episodes_skipped', '?')}"
+        )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2595,7 +3044,7 @@ def main():
     PAGES = [
         "📊 Overview", "📈 Blackbox Charts", "⚙️ Whitebox Charts",
         "📍 Path Efficiency", "⚡ Resource Cost", "🏁 BO Trials", "🔀 Compare",
-        "🎯 Convergence", "📖 Commands",
+        "🎯 Convergence", "📖 Commands", "🆘 Training Commands / Crash Resume",
     ]
     view = st.radio("View", PAGES, horizontal=True, key="main_view",
                     label_visibility="collapsed")
@@ -2673,6 +3122,9 @@ def main():
 
     elif view == "📖 Commands":
         _section_commands()
+
+    elif view == "🆘 Training Commands / Crash Resume":
+        _section_training_commands()
 
     # ── Auto-refresh ─────────────────────────────────────────────────────────
     if auto_refresh:
